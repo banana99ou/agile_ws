@@ -1,4 +1,34 @@
 #!/usr/bin/env python3
+"""
+ROS2 node that feeds RTCM to F9P-Helical and publishes GPS-RTK data.
+
+This node:
+- Connects to a TCP RTCM broadcaster
+- Pumps RTCM3 bytes into F9P-Helical
+- Reads NMEA from F9P-Helical and publishes RTK GPS data
+- Publishes human-readable status information
+
+Requires:
+- F9P-Helical setup to take NMEA+UBX+RTCM3 in and NMEA+UBX out over USB.
+    - MSG USB NMEA+UBX+RTCM3 in NMEA+UBX out
+    - PRT
+        - UBX-NAV-PVT (position/vel/time)
+        - UBX-NAV-RELPOSNED (RTK indicator: float/fix + baseline)
+        - UBX-RXM-RTCM (RTCM3 messages)
+        - UBX-NAV-STATUS (general fix flags / solution status)
+        - UBX-NAV-SAT (satellites in view)
+        - UBX-NAV-SIG (signal strength)
+    - CFG
+        - save to flash
+    - refer to: https://docs.holybro.com/gps-and-rtk-system/zed-f9p-h-rtk-series/portable-rtk-base-station-setup
+- TCP RTCM broadcaster running (e.g. rtcm_server.py)
+- RTCM3 messages being sent to the broadcaster
+
+Publishes:
+- NavSatFix: RTK GPS data
+- String: human-readable status
+"""
+
 import threading
 import socket
 import serial
