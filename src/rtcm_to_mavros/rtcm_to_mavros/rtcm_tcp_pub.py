@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+"""
+deprecated: use GPS-RTK_ROS2_pub_node.py instead
+"""
 import socket
 import rclpy
 from rclpy.node import Node
