@@ -7,14 +7,19 @@ import pynmea2
 from dataclasses import dataclass, field
 from typing import Optional
 
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import NavSatFix, NavSatStatus
+from std_msgs.msg import String
+
 # -------------- CONFIG --------------
 
-# Change this if your F9P USB appears differently
-SERIAL_PORT = "/dev/ttyACM0"
-SERIAL_BAUD = 57600      # you said 57600
+# SERIAL_PORT = "/dev/ttyACM0"
+SERIAL_PORT = "/dev/f9p_helical"
+SERIAL_BAUD = 57600
 
-TCP_HOST = "10.0.0.42"   # your broadcaster
-TCP_PORT = 2101          # your broadcaster port
+TCP_HOST = "10.0.0.42"
+TCP_PORT = 2101
 
 STATUS_PRINT_INTERVAL = 1.0   # seconds
 RTCM_STALE_SECONDS = 5.0      # consider RTCM stale after this
@@ -25,6 +30,7 @@ RTCM_STALE_SECONDS = 5.0      # consider RTCM stale after this
 class GNSSStatus:
     lat: Optional[float] = None
     lon: Optional[float] = None
+    alt: Optional[float] = None
     fix_quality: int = 0
     fix_desc: str = "NO FIX"
     num_sats: int = 0
@@ -119,6 +125,127 @@ def fix_quality_to_desc(q: int) -> str:
     }
     return mapping.get(q, f"UNKNOWN({q})")
 
+class HelicalGpsNode(Node):
+    """ROS2 node that feeds RTCM to F9P and publishes RTK GPS data."""
+
+    def __init__(self):
+        super().__init__("helical_gps_rtk_node")
+
+        self.ser_mgr = SerialManager(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+        self.gnss_status = GNSSStatus()
+        self.rtcm_status = RTCMStatus()
+        self._stop_event = threading.Event()
+
+        # Publishers
+        self.fix_pub = self.create_publisher(NavSatFix, "gps/fix", 10)
+        self.nmea_pub = self.create_publisher(String, "gps/nmea", 10)
+        self.status_pub = self.create_publisher(String, "gps/rtk_status", 10)
+
+        # Start worker threads
+        self._rtcm_thread = threading.Thread(
+            target=rtcm_forwarder,
+            args=(self.ser_mgr, self.rtcm_status, self._stop_event),
+            daemon=True,
+        )
+        self._nmea_thread = threading.Thread(
+            target=nmea_reader,
+            args=(self.ser_mgr, self.gnss_status, self, self._stop_event),
+            daemon=True,
+        )
+        # Optional console status printer (same as original script)
+        self._status_thread = threading.Thread(
+            target=status_printer,
+            args=(self.gnss_status, self.rtcm_status, self._stop_event),
+            daemon=True,
+        )
+        self._rtcm_thread.start()
+        self._nmea_thread.start()
+        self._status_thread.start()
+
+        # Status + NavSatFix publisher timer
+        self.create_timer(STATUS_PRINT_INTERVAL, self._status_timer_cb)
+
+        self.get_logger().info("Helical GPS RTK node started.")
+
+    def publish_nmea(self, line: str):
+        """Publish raw NMEA sentence."""
+        msg = String()
+        msg.data = line
+        self.nmea_pub.publish(msg)
+
+    def _status_timer_cb(self):
+        """Publish NavSatFix and human-readable RTK status string."""
+        now = self.get_clock().now().to_msg()
+        gs = self.gnss_status
+        rs = self.rtcm_status
+        t_now = time.time()
+
+        # RTCM status
+        if rs.last_rx_time > 0:
+            rtcm_age = t_now - rs.last_rx_time
+            rtcm_active = rtcm_age < RTCM_STALE_SECONDS
+        else:
+            rtcm_age = float("inf")
+            rtcm_active = False
+
+        # NavSatFix
+        fix_msg = NavSatFix()
+        fix_msg.header.stamp = now
+        fix_msg.header.frame_id = "f9p_helical"
+
+        fix_msg.latitude = gs.lat if gs.lat is not None else float("nan")
+        fix_msg.longitude = gs.lon if gs.lon is not None else float("nan")
+        fix_msg.altitude = gs.alt if gs.alt is not None else float("nan")
+
+        status = NavSatStatus()
+        status.service = (
+            NavSatStatus.SERVICE_GPS
+            | NavSatStatus.SERVICE_GLONASS
+            | NavSatStatus.SERVICE_GALILEO
+            | NavSatStatus.SERVICE_COMPASS
+        )
+        if gs.fix_quality == 0:
+            status.status = NavSatStatus.STATUS_NO_FIX
+        elif gs.fix_quality in (1, 2, 3):
+            status.status = NavSatStatus.STATUS_FIX
+        elif gs.fix_quality in (4, 5):
+            # Treat RTK FIX/FLOAT as high-quality differential fix
+            status.status = NavSatStatus.STATUS_GBAS_FIX
+        else:
+            status.status = NavSatStatus.STATUS_FIX
+        fix_msg.status = status
+        fix_msg.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
+
+        self.fix_pub.publish(fix_msg)
+
+        # Human-readable status
+        lat_str = f"{gs.lat:.8f}" if gs.lat is not None else "N/A"
+        lon_str = f"{gs.lon:.8f}" if gs.lon is not None else "N/A"
+        hdop_str = f"{gs.hdop:.2f}" if gs.hdop is not None else "N/A"
+
+        status_str = (
+            f"FIX: {gs.fix_desc} "
+            f"(quality={gs.fix_quality}, sats={gs.num_sats}, HDOP={hdop_str}) | "
+            f"Lat={lat_str}, Lon={lon_str} | "
+            f"RTCM: {'ACTIVE' if rtcm_active else 'STALE'} "
+            f"(bytes={rs.total_bytes}, age={rtcm_age:.1f}s)"
+        )
+
+        s_msg = String()
+        s_msg.data = status_str
+        self.status_pub.publish(s_msg)
+
+        # Also log occasionally
+        self.get_logger().info(status_str)
+
+    def destroy_node(self):
+        self.get_logger().info("Shutting down Helical GPS RTK node...")
+        self._stop_event.set()
+        time.sleep(0.5)
+        self.ser_mgr.close()
+        super().destroy_node()
+
+
 # -------------- THREADS --------------
 
 def rtcm_forwarder(ser_mgr: SerialManager, rtcm_status: RTCMStatus, stop_event: threading.Event):
@@ -149,8 +276,10 @@ def rtcm_forwarder(ser_mgr: SerialManager, rtcm_status: RTCMStatus, stop_event: 
             time.sleep(5)
 
 
-def nmea_reader(ser_mgr: SerialManager, gnss_status: GNSSStatus, stop_event: threading.Event):
-    """Read NMEA from F9P and update GNSS status."""
+def nmea_reader(
+    ser_mgr: SerialManager, gnss_status: GNSSStatus, node: HelicalGpsNode, stop_event: threading.Event
+):
+    """Read NMEA from F9P, update GNSS status, and publish raw NMEA."""
     while not stop_event.is_set():
         try:
             line_bytes = ser_mgr.readline()
@@ -162,6 +291,13 @@ def nmea_reader(ser_mgr: SerialManager, gnss_status: GNSSStatus, stop_event: thr
             if not line.startswith("$"):
                 # probably UBX or other binary, ignore
                 continue
+
+            # Publish raw NMEA
+            if node is not None:
+                try:
+                    node.publish_nmea(line)
+                except Exception as e:
+                    node.get_logger().warn(f"Failed to publish NMEA: {e}")
 
             # Uncomment for debugging raw NMEA:
             # print(f"[NMEA] {line}")
@@ -177,6 +313,10 @@ def nmea_reader(ser_mgr: SerialManager, gnss_status: GNSSStatus, stop_event: thr
             if isinstance(msg, pynmea2.types.talker.GGA):
                 gnss_status.lat = msg.latitude if msg.latitude != "" else None
                 gnss_status.lon = msg.longitude if msg.longitude != "" else None
+                try:
+                    gnss_status.alt = float(msg.altitude) if msg.altitude not in ("", None) else None
+                except (ValueError, TypeError, AttributeError):
+                    gnss_status.alt = None
 
                 try:
                     q = int(msg.gps_qual)
@@ -197,7 +337,10 @@ def nmea_reader(ser_mgr: SerialManager, gnss_status: GNSSStatus, stop_event: thr
 
         except Exception as e:
             # Catch-all to avoid killing the thread on unexpected errors
-            print(f"[NMEA] Unexpected error: {e}")
+            if node is not None:
+                node.get_logger().warn(f"[NMEA] Unexpected error: {e}")
+            else:
+                print(f"[NMEA] Unexpected error: {e}")
             time.sleep(1.0)
 
 
@@ -233,29 +376,15 @@ def status_printer(gnss_status: GNSSStatus, rtcm_status: RTCMStatus, stop_event:
 # -------------- MAIN --------------
 
 def main():
-    ser_mgr = SerialManager(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-
-    gnss_status = GNSSStatus()
-    rtcm_status = RTCMStatus()
-    stop_event = threading.Event()
-
-    threads = [
-        threading.Thread(target=rtcm_forwarder, args=(ser_mgr, rtcm_status, stop_event), daemon=True),
-        threading.Thread(target=nmea_reader, args=(ser_mgr, gnss_status, stop_event), daemon=True),
-        threading.Thread(target=status_printer, args=(gnss_status, rtcm_status, stop_event), daemon=True),
-    ]
-    for t in threads:
-        t.start()
-
-    print("Running. Ctrl+C to stop.")
+    rclpy.init()
+    node = HelicalGpsNode()
     try:
-        while True:
-            time.sleep(0.5)
+        rclpy.spin(node)
     except KeyboardInterrupt:
-        print("Stopping...")
-        stop_event.set()
-        time.sleep(1.0)
-        ser_mgr.close()
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
