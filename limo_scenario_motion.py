@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 
+"""
+Scenario Runner prototype for LIMO GNSS experiments.
+
+This script is intentionally small: it is the **motion module** used by a larger
+experiment system (see the repository root `README.md`).
+
+Role in the bigger system:
+- Publishes `cmd_vel` to execute simple motion scenarios (open-loop).
+- Subscribes to `/wheel/odom` to estimate yaw/velocity and to apply a basic
+  heading-hold correction while moving.
+
+Non-goals:
+- This is **not** a localization solution and does not provide ground truth.
+- It does not manage rosbag recording (that belongs in an Experiment Manager / Recorder).
+"""
+
 import sys
 import math
 import time
@@ -31,8 +47,14 @@ def normalize_angle(a: float) -> float:
 
 class OdomWatcher(Node):
     """
-    Simple node to watch /wheel/odom and drive /cmd_vel
-    for experiment scenarios.
+    Simple Scenario Runner:
+    - **Input**: `/wheel/odom` (for yaw and linear velocity estimates)
+    - **Output**: `cmd_vel` (Twist)
+
+    Notes:
+    - Heading hold uses odom yaw and will drift if `/wheel/odom` yaw drifts.
+    - This is acceptable for the current experiment goal (GNSS fix/re-fix timelines),
+      where motion is used to provide comparable operating conditions, not ground truth.
     """
 
     def __init__(self):
