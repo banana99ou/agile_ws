@@ -44,3 +44,8 @@ src/rf2o_laser_odometry/
 src/ros2_astra_camera/libuvc/
 src/ydlidar_ros2_driver/
 src/yolov5_ros2/
+
+########################
+# FTG data files
+########################
+ohcoach-cell-tools/FTG/

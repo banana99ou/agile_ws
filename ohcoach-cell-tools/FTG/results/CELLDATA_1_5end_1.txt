@@ -1,5 +1,0 @@
-power_off=b'N'
-battery_voltage=357
-operation_time=503
-used_nand_block_size=0
-used_nand_page_size=0
