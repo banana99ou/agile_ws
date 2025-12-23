@@ -35,8 +35,11 @@ log/
 ########################
 # Embedded git repositories (submodules)
 ########################
-src
-!src/limo_ros2/limo_base/launch
+src/*
+!src/limo_ros2/
+!src/limo_ros2/limo_base/
+!src/limo_ros2/limo_base/launch/
+!src/limo_ros2/limo_base/launch/**
 
 ########################
 # FTG data files
