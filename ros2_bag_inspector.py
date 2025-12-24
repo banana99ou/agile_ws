@@ -25,6 +25,8 @@ import os
 import sys
 from typing import Dict, Tuple
 
+import yaml
+
 try:
     import rosbag2_py
     from rclpy.serialization import deserialize_message
@@ -40,19 +42,62 @@ except ImportError as exc:
     raise
 
 
+def _detect_storage_id(bag_path: str) -> str:
+    """
+    Try to detect the storage backend (e.g. sqlite3, mcap) from metadata.yaml.
+    Fallback to 'sqlite3' if not found.
+    """
+    meta_path = os.path.join(bag_path, "metadata.yaml")
+    if not os.path.exists(meta_path):
+        return "sqlite3"
+
+    try:
+        with open(meta_path, "r") as f:
+            meta = yaml.safe_load(f) or {}
+    except Exception:
+        # If metadata cannot be read/parsed, fall back to sqlite3
+        return "sqlite3"
+
+    # Common layouts used by rosbag2
+    storage_id = (
+        meta.get("storage_identifier")
+        or meta.get("storage_id")
+        or meta.get("storage")
+    )
+    if not storage_id:
+        info = meta.get("rosbag2_bagfile_information", {})
+        storage_id = (
+            info.get("storage_identifier")
+            or info.get("storage_id")
+            or info.get("storage")
+        )
+
+    return storage_id or "sqlite3"
+
+
 def open_bag_reader(bag_path: str) -> Tuple[rosbag2_py.SequentialReader, Dict[str, str]]:
     """Open a ros2 bag for reading and return (reader, topic_type_map)."""
     if not os.path.isdir(bag_path):
         raise FileNotFoundError(f"Bag path is not a directory: {bag_path}")
 
+    storage_id = _detect_storage_id(bag_path)
+
     storage_options = rosbag2_py.StorageOptions(
         uri=bag_path,
-        storage_id="sqlite3",
+        storage_id=storage_id,
     )
     converter_options = rosbag2_py.ConverterOptions("", "")
 
     reader = rosbag2_py.SequentialReader()
-    reader.open(storage_options, converter_options)
+    try:
+        reader.open(storage_options, converter_options)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Failed to open bag at '{bag_path}' with storage_id '{storage_id}'.\n"
+            f"Original error: {e}\n"
+            f"- Check that this is the actual bag directory (it should contain 'metadata.yaml').\n"
+            f"- Ensure you have read permissions and the disk is accessible.\n"
+        ) from e
 
     topic_type_map: Dict[str, str] = {}
     for t in reader.get_all_topics_and_types():
@@ -136,6 +181,61 @@ def export_topic_to_csv(bag_path: str, topic_name: str, out_csv: str) -> None:
     )
 
 
+def export_all_topics_to_csv(bag_path: str, out_csv: str) -> None:
+    """
+    Export all messages from all topics into a single CSV file.
+
+    Columns:
+      - timestamp (ROS time, seconds as float)
+      - topic
+      - type
+      - message_json (all fields as JSON text)
+    """
+    reader, topic_type_map = open_bag_reader(bag_path)
+
+    # Cache for message classes per ROS type string
+    msg_type_cache: Dict[str, type] = {}
+
+    fieldnames = ["timestamp", "topic", "type", "message_json"]
+    os.makedirs(os.path.dirname(os.path.abspath(out_csv)), exist_ok=True)
+    total_written = 0
+
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        while reader.has_next():
+            topic, data, t = reader.read_next()
+            type_str = topic_type_map.get(topic)
+            if not type_str:
+                # Unknown topic type; skip (should not normally happen)
+                continue
+
+            if type_str not in msg_type_cache:
+                msg_type_cache[type_str] = get_message(type_str)
+            msg_type = msg_type_cache[type_str]
+
+            msg = deserialize_message(data, msg_type)
+            msg_dict = message_to_ordereddict(msg)
+
+            timestamp_sec = t / 1e9
+
+            writer.writerow(
+                {
+                    "timestamp": f"{timestamp_sec:.9f}",
+                    "topic": topic,
+                    "type": type_str,
+                    "message_json": json.dumps(msg_dict),
+                }
+            )
+            total_written += 1
+
+    print(
+        f"Exported {total_written} messages from all topics in '{bag_path}' "
+        f"to CSV file: {out_csv}"
+    )
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Inspect and export ROS 2 bag files."
@@ -173,6 +273,21 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Output CSV file path (e.g. topic_data.csv).",
     )
 
+    # export-all command
+    p_export_all = subparsers.add_parser(
+        "export-all",
+        help="Export all messages from all topics to a single CSV file.",
+    )
+    p_export_all.add_argument(
+        "bag_path",
+        help="Path to the ros2 bag directory.",
+    )
+    p_export_all.add_argument(
+        "--out",
+        required=True,
+        help="Output CSV file path (e.g. all_topics.csv).",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -183,6 +298,8 @@ def main(argv=None) -> None:
         list_bag_topics(args.bag_path)
     elif args.command == "export":
         export_topic_to_csv(args.bag_path, args.topic, args.out)
+    elif args.command == "export-all":
+        export_all_topics_to_csv(args.bag_path, args.out)
     else:
         raise RuntimeError(f"Unknown command: {args.command}")
 
