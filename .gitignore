@@ -37,6 +37,7 @@ log/
 ########################
 src/*
 !src/limo_ros2/limo_base/launch/**
+!src/limo_ros2/limo_base/include/limo_base/**
 
 ########################
 # FTG data files
