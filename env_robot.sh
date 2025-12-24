@@ -10,3 +10,5 @@ unset RMW_IMPLEMENTATION
 
 # Make sure we’re not in localhost-only discovery mode
 unset ROS_LOCALHOST_ONLY
+ros2 daemon stop
+ros2 daemon start
