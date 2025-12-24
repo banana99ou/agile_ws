@@ -25,6 +25,7 @@ TOPICS = [
     "/cmd_vel",
     "/cmd_vel_raw",
     "/imu",
+    "/estop",
 ]
 
 
