@@ -37,7 +37,7 @@ class EstopCliNode(Node):
 
         self.estop_active = False
         self.ping_targets = ["google.com", "10.0.0.42"]
-        self.ping_interval = 2.0  # seconds
+        self.ping_interval = 1.0  # seconds
         self.ping_timeout = 1.0  # seconds
 
         self.estop_pub = self.create_publisher(Bool, "/estop", 10)
@@ -109,7 +109,7 @@ class EstopCliNode(Node):
         except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
             self.get_logger().debug(f"Ping error for {host}: {e}")
             return False
-
+    #! need to check if this function is or operation.
     def check_connectivity(self):
         """Check connectivity to all ping targets and trip estop if any fail."""
         for target in self.ping_targets:
@@ -172,6 +172,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-
-
-
