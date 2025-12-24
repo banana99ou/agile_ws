@@ -43,8 +43,8 @@ def generate_launch_description():
             # --- LIMO base args (mirrors limo_with_mavros.launch.py) ---
             DeclareLaunchArgument(
                 "port_name",
-                default_value="usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0",
-                description="USB bus name for LIMO base, e.g. ttyUSB1",
+                default_value="limo_base",
+                description="USB device name for LIMO base (e.g. ttyUSB1 or a udev symlink like limo_base)",
             ),
             DeclareLaunchArgument(
                 "odom_frame",
@@ -108,9 +108,13 @@ def generate_launch_description():
             #   - /gps/nmea
             #   - /gps/rtk_status
             ExecuteProcess(
-                cmd=[sys.executable, str(gps_rtk_script)],
+                cmd=[
+                    sys.executable,
+                    str(gps_rtk_script),
+                    "--ros-args",
+                    "-r", "__ns:=/gps_rtk_f9p_helical",
+                ],
                 output="screen",
             ),
         ]
     )
-
