@@ -14,6 +14,24 @@ Role in the bigger system:
 Non-goals:
 - This is **not** a localization solution and does not provide ground truth.
 - It does not manage rosbag recording (that belongs in an Experiment Manager / Recorder).
+
+How to Use
+----------
+1. Make sure ROS 2 is sourced and running.
+2. Launch the `limo_base` driver and make sure `/wheel/odom` is being published.
+3. Run this script:
+    $ python3 limo_scenario_motion.py [options]
+
+   Available options:
+   - Use `--help` to see available scenario and control parameters.
+   - Example: to drive forward 2m with yaw hold at 0.3 m/s:
+        $ python3 limo_scenario_motion.py --distance 2.0 --speed 0.3
+
+4. The script will issue velocity commands (`cmd_vel`) to LIMO in open-loop or heading-hold modes,
+   reading the current yaw/velocity from `/wheel/odom`.
+
+This script is for GNSS and re-fix timeline experiments and repeatable motion primitives.
+See README for integration and experiment orchestration.
 """
 
 import sys
@@ -66,7 +84,9 @@ class OdomWatcher(Node):
             self.odom_callback,
             10,
         )
-        self.pub = self.create_publisher(Twist, "cmd_vel", 10)
+        # Publish raw velocity commands; an external safety/E-stop node should
+        # subscribe to `cmd_vel_raw` and publish filtered commands on `cmd_vel`.
+        self.pub = self.create_publisher(Twist, "cmd_vel_raw", 10)
 
         self.last_x: Optional[float] = None
         self.last_y: Optional[float] = None
@@ -484,5 +504,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main(sys.argv[1:])
-
-

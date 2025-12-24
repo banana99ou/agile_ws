@@ -154,7 +154,6 @@ class StateWatcher(Node):
         self.rally_lon = None
 
     def odom_callback(self, msg: Odometry):
-        print("odom_callback")
         self.last_x = msg.pose.pose.position.x
         self.last_y = msg.pose.pose.position.y
         self.last_yaw = quat_to_yaw_z(msg.pose.pose.orientation)
@@ -238,10 +237,11 @@ def run_segment_forward_yaw_hold(
             break
 
         yaw_err = normalize_angle(node.last_yaw - yaw_ref)
-        yaw_err_diff = (prev_yaw_err - yaw_err) / dt
+        yaw_err_diff = (yaw_err - prev_yaw_err) / dt
         prev_yaw_err = yaw_err
 
-        omega = -P * yaw_err - D * yaw_err_diff
+        omega = - P * yaw_err
+        print(f"omega: {omega}, P: {-P * yaw_err} D: {D * yaw_err_diff}")
         omega = max(min(omega, max_omega), -max_omega)
 
         twist = Twist()
@@ -255,7 +255,7 @@ def run_segment_forward_yaw_hold(
     pub.publish(twist)
     logger.info("Segment finished; robot stopped.")
 
-    return prev_yaw_err
+    return yaw_err
 
 
 def run_go_to_rally(
@@ -263,7 +263,7 @@ def run_go_to_rally(
     pub,
     speed: float = 0.3,
     max_omega: float = 0.5,
-    K_yaw: float = 1.5,
+    P_yaw: float = 1.5,
     K_dist: float = 0.5,
     stop_dist: float = 0.1,
     rate_hz: float = 20.0,
@@ -320,7 +320,7 @@ def run_go_to_rally(
         else:
             lin = max(min(K_dist * dist, speed), 0.0)
 
-        omega = K_yaw * yaw_err
+        omega = P_yaw * yaw_err
         omega = max(min(omega, max_omega), -max_omega)
 
         twist = Twist()
@@ -341,7 +341,10 @@ def main():
     rclpy.init()
 
     node = StateWatcher()
-    pub = node.create_publisher(Twist, 'cmd_vel', 10)
+    # Publish raw velocity commands; an external safety/E-stop node should
+    # subscribe to `cmd_vel_raw` and publish filtered commands on `cmd_vel`.
+    pub = node.create_publisher(Twist, 'cmd_vel_raw', 10)
+    # pub = node.create_publisher(Twist, 'cmd_vel', 10)
 
     speed = 0.3   # default forward speed
     turn = 1.0
@@ -408,7 +411,7 @@ def main():
                     pub,
                     speed=speed,
                     max_omega=0.5,
-                    K_yaw=1.5,
+                    P_yaw=1.5,
                     K_dist=0.5,
                     stop_dist=0.1,
                     rate_hz=20.0,
