@@ -23,7 +23,7 @@ import csv
 import json
 import os
 import sys
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Set, List
 
 import yaml
 
@@ -73,6 +73,34 @@ def _detect_storage_id(bag_path: str) -> str:
         )
 
     return storage_id or "sqlite3"
+
+
+def _flatten_dict(prefix: str, value, out: Dict[str, float]) -> None:
+    """
+    Flatten a nested dict/list structure into a single-level dict.
+
+    Example:
+      {"pose": {"x": 1.0, "y": 2.0}}  ->
+        {"pose__x": 1.0, "pose__y": 2.0}
+
+    Lists are indexed: "covariance__0", "covariance__1", ...
+    Non-numeric values are converted to strings so they can still be inspected.
+    """
+    if isinstance(value, dict):
+        for k, v in value.items():
+            new_prefix = f"{prefix}__{k}" if prefix else str(k)
+            _flatten_dict(new_prefix, v, out)
+    elif isinstance(value, (list, tuple)):
+        for i, v in enumerate(value):
+            new_prefix = f"{prefix}__{i}" if prefix else str(i)
+            _flatten_dict(new_prefix, v, out)
+    else:
+        # Base case: scalar value
+        # Prefer numeric types, but fall back to string for others.
+        if isinstance(value, (int, float)):
+            out[prefix] = value
+        else:
+            out[prefix] = str(value)
 
 
 def open_bag_reader(bag_path: str) -> Tuple[rosbag2_py.SequentialReader, Dict[str, str]]:
@@ -236,6 +264,87 @@ def export_all_topics_to_csv(bag_path: str, out_csv: str) -> None:
     )
 
 
+def export_all_topics_flat_to_csv(bag_path: str, out_csv: str) -> None:
+    """
+    Export all messages from all topics into a single *wide* CSV file.
+
+    This is designed for plotting in Excel / similar tools:
+      - one row per message
+      - columns:
+          timestamp, topic, type, and one column per flattened message field
+      - nested fields become columns like: pose__position__x
+      - arrays become columns like: covariance__0, covariance__1, ...
+    """
+    # First pass: discover all flattened field names
+    reader, topic_type_map = open_bag_reader(bag_path)
+    msg_type_cache: Dict[str, type] = {}
+    all_field_names: Set[str] = set()
+
+    while reader.has_next():
+        topic, data, _ = reader.read_next()
+        type_str = topic_type_map.get(topic)
+        if not type_str:
+            continue
+
+        if type_str not in msg_type_cache:
+            msg_type_cache[type_str] = get_message(type_str)
+        msg_type = msg_type_cache[type_str]
+
+        msg = deserialize_message(data, msg_type)
+        msg_dict = message_to_ordereddict(msg)
+
+        flat: Dict[str, float] = {}
+        _flatten_dict("", msg_dict, flat)
+        all_field_names.update(flat.keys())
+
+    # Second pass: actually write CSV with complete header
+    reader, topic_type_map = open_bag_reader(bag_path)
+    msg_type_cache.clear()
+
+    ordered_fields: List[str] = sorted(all_field_names)
+    fieldnames = ["timestamp", "topic", "type"] + ordered_fields
+    os.makedirs(os.path.dirname(os.path.abspath(out_csv)), exist_ok=True)
+    total_written = 0
+
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        while reader.has_next():
+            topic, data, t = reader.read_next()
+            type_str = topic_type_map.get(topic)
+            if not type_str:
+                continue
+
+            if type_str not in msg_type_cache:
+                msg_type_cache[type_str] = get_message(type_str)
+            msg_type = msg_type_cache[type_str]
+
+            msg = deserialize_message(data, msg_type)
+            msg_dict = message_to_ordereddict(msg)
+
+            flat: Dict[str, float] = {}
+            _flatten_dict("", msg_dict, flat)
+
+            timestamp_sec = t / 1e9
+
+            row = {
+                "timestamp": f"{timestamp_sec:.9f}",
+                "topic": topic,
+                "type": type_str,
+            }
+            for name in ordered_fields:
+                row[name] = flat.get(name, "")
+
+            writer.writerow(row)
+            total_written += 1
+
+    print(
+        f"Exported {total_written} messages from all topics in '{bag_path}' "
+        f"to wide CSV file: {out_csv}"
+    )
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Inspect and export ROS 2 bag files."
@@ -288,6 +397,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Output CSV file path (e.g. all_topics.csv).",
     )
 
+    # export-all-flat command
+    p_export_all_flat = subparsers.add_parser(
+        "export-all-flat",
+        help=(
+            "Export all messages from all topics to a single wide CSV file "
+            "suitable for plotting (one column per message field)."
+        ),
+    )
+    p_export_all_flat.add_argument(
+        "bag_path",
+        help="Path to the ros2 bag directory.",
+    )
+    p_export_all_flat.add_argument(
+        "--out",
+        required=True,
+        help="Output CSV file path (e.g. all_topics_flat.csv).",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -300,6 +427,8 @@ def main(argv=None) -> None:
         export_topic_to_csv(args.bag_path, args.topic, args.out)
     elif args.command == "export-all":
         export_all_topics_to_csv(args.bag_path, args.out)
+    elif args.command == "export-all-flat":
+        export_all_topics_flat_to_csv(args.bag_path, args.out)
     else:
         raise RuntimeError(f"Unknown command: {args.command}")
 
