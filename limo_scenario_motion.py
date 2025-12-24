@@ -38,6 +38,9 @@ import sys
 import math
 import time
 import argparse
+import subprocess
+import signal
+from pathlib import Path
 from typing import Optional
 
 import rclpy
@@ -466,6 +469,34 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
 
+    # ------------------------------------------------------------------
+    # Start Data_Logger.py (ROS 2 bag recorder) before any motion begins
+    # ------------------------------------------------------------------
+    logger_proc = None
+    scenario_label = args.scenario
+    data_logger_script = Path(__file__).resolve().with_name("Data_Logger.py")
+
+    try:
+        logger_proc = subprocess.Popen(
+            [sys.executable, str(data_logger_script), scenario_label]
+        )
+        print(
+            f"[limo_scenario_motion] Started Data_Logger.py for scenario "
+            f"'{scenario_label}' (PID={logger_proc.pid})"
+        )
+    except FileNotFoundError:
+        print(
+            "[limo_scenario_motion] Error: Data_Logger.py not found; ROS 2 bag recording is required to proceed.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except Exception as e:
+        print(
+            f"[limo_scenario_motion] Warning: failed to start Data_Logger.py: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     rclpy.init()
     node = OdomWatcher()
 
@@ -500,6 +531,24 @@ def main(argv=None):
         node.stop_robot()
         node.destroy_node()
         rclpy.shutdown()
+
+        # --------------------------------------------------------------
+        # Stop Data_Logger.py gracefully so the bag is finalized/renamed
+        # --------------------------------------------------------------
+        if logger_proc is not None:
+            try:
+                logger_proc.send_signal(signal.SIGINT)
+                try:
+                    logger_proc.wait(timeout=15.0)
+                except subprocess.TimeoutExpired:
+                    logger_proc.kill()
+                    logger_proc.wait()
+            except Exception as e:
+                print(
+                    f"[limo_scenario_motion] Warning: failed to stop "
+                    f"Data_Logger.py cleanly: {e}",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":
