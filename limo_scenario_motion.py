@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 Scenario Runner prototype for LIMO GNSS experiments.
 
@@ -469,36 +468,38 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
 
-    # ------------------------------------------------------------------
-    # Start Data_Logger.py (ROS 2 bag recorder) before any motion begins
-    # ------------------------------------------------------------------
-    logger_proc = None
-    scenario_label = args.scenario
-    data_logger_script = Path(__file__).resolve().with_name("Data_Logger.py")
+    # # ------------------------------------------------------------------
+    # # Start Data_Logger.py (ROS 2 bag recorder) before any motion begins
+    # # ------------------------------------------------------------------
+    # logger_proc = None
+    # scenario_label = args.scenario
+    # data_logger_script = Path(__file__).resolve().with_name("Data_Logger.py")
 
-    try:
-        logger_proc = subprocess.Popen(
-            [sys.executable, str(data_logger_script), scenario_label]
-        )
-        print(
-            f"[limo_scenario_motion] Started Data_Logger.py for scenario "
-            f"'{scenario_label}' (PID={logger_proc.pid})"
-        )
-    except FileNotFoundError:
-        print(
-            "[limo_scenario_motion] Error: Data_Logger.py not found; ROS 2 bag recording is required to proceed.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    except Exception as e:
-        print(
-            f"[limo_scenario_motion] Warning: failed to start Data_Logger.py: {e}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    # # start data logger b4 motion begins.
+    # # cannot run withour data logger.
+    # try:
+    #     logger_proc = subprocess.Popen(
+    #         [sys.executable, str(data_logger_script), scenario_label]
+    #     )
+    #     print(
+    #         f"[limo_scenario_motion] Started Data_Logger.py for scenario "
+    #         f"'{scenario_label}' (PID={logger_proc.pid})"
+    #     )
+    # except FileNotFoundError:
+    #     print(
+    #         "[limo_scenario_motion] Error: Data_Logger.py not found; ROS 2 bag recording is required to proceed.",
+    #         file=sys.stderr,
+    #     )
+    #     sys.exit(1)
+    # except Exception as e:
+    #     print(
+    #         f"[limo_scenario_motion] Warning: failed to start Data_Logger.py: {e}",
+    #         file=sys.stderr,
+    #     )
+    #     sys.exit(1)
 
-    rclpy.init()
-    node = OdomWatcher()
+    # rclpy.init()
+    # node = OdomWatcher()
 
     try:
         if args.scenario == "static":
