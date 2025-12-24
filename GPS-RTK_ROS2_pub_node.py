@@ -10,14 +10,15 @@ This node:
 
 Requires:
 - F9P-Helical setup to take NMEA+UBX+RTCM3 in and NMEA+UBX out over USB.
-    - MSG USB NMEA+UBX+RTCM3 in NMEA+UBX out
+    - MSG 
+        - USB NMEA+UBX+RTCM3 in NMEA+UBX out
     - PRT
-        - UBX-NAV-PVT (position/vel/time)
+        - UBX-NAV-PVT       (position/vel/time)
         - UBX-NAV-RELPOSNED (RTK indicator: float/fix + baseline)
-        - UBX-RXM-RTCM (RTCM3 messages)
-        - UBX-NAV-STATUS (general fix flags / solution status)
-        - UBX-NAV-SAT (satellites in view)
-        - UBX-NAV-SIG (signal strength)
+        - UBX-RXM-RTCM      (RTCM3 messages)
+        - UBX-NAV-STATUS    (general fix flags / solution status)
+        - UBX-NAV-SAT       (satellites in view)
+        - UBX-NAV-SIG       (signal strength)
     - CFG
         - save to flash
     - refer to: https://docs.holybro.com/gps-and-rtk-system/zed-f9p-h-rtk-series/portable-rtk-base-station-setup
@@ -395,13 +396,13 @@ def status_printer(gnss_status: GNSSStatus, rtcm_status: RTCMStatus, stop_event:
         lon_str = f"{lon:.8f}" if lon is not None else "N/A"
         hdop_str = f"{gnss_status.hdop:.2f}" if gnss_status.hdop is not None else "N/A"
 
-        print(
-            f"[STATUS] FIX: {gnss_status.fix_desc} "
-            f"(quality={gnss_status.fix_quality}, sats={gnss_status.num_sats}, HDOP={hdop_str}) | "
-            f"Lat={lat_str}, Lon={lon_str} | "
-            f"RTCM: {'ACTIVE' if rtcm_active else 'STALE'} "
-            f"(bytes={rtcm_status.total_bytes}, age={rtcm_age:.1f}s)"
-        )
+        # print(
+        #     f"[STATUS] FIX: {gnss_status.fix_desc} "
+        #     f"(quality={gnss_status.fix_quality}, sats={gnss_status.num_sats}, HDOP={hdop_str}) | "
+        #     f"Lat={lat_str}, Lon={lon_str} | "
+        #     f"RTCM: {'ACTIVE' if rtcm_active else 'STALE'} "
+        #     f"(bytes={rtcm_status.total_bytes}, age={rtcm_age:.1f}s)"
+        # )
 
 # -------------- MAIN --------------
 
