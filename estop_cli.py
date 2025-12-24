@@ -6,6 +6,7 @@ Terminal-based E-stop and safety filter for LIMO.
 Use this when you are SSH'ed into the robot and cannot open a GUI window.
 
 Behavior:
+- Checks connectivity to the MacBook control station (10.0.0.42) or internet (google.com) and trips the E-stop if it fails.
 - Subscribes to raw velocity commands on `cmd_vel_raw`.
 - Publishes safe velocity commands on `cmd_vel`.
 - Publishes the E-stop state on `/estop` (std_msgs/Bool).
@@ -20,6 +21,8 @@ import sys
 import select
 import termios
 import tty
+import subprocess
+import platform
 
 import rclpy
 from rclpy.node import Node
@@ -33,6 +36,9 @@ class EstopCliNode(Node):
         super().__init__("limo_estop_cli")
 
         self.estop_active = False
+        self.ping_targets = ["google.com", "10.0.0.42"]
+        self.ping_interval = 2.0  # seconds
+        self.ping_timeout = 1.0  # seconds
 
         self.estop_pub = self.create_publisher(Bool, "/estop", 10)
         self.cmd_vel_pub = self.create_publisher(Twist, "cmd_vel", 10)
@@ -40,9 +46,16 @@ class EstopCliNode(Node):
             Twist, "cmd_vel_raw", self.cmd_vel_raw_callback, 10
         )
 
+        # Create timer for periodic ping checks
+        self.ping_timer = self.create_timer(self.ping_interval, self.check_connectivity)
+
         self.get_logger().info(
             "LIMO E-stop CLI initialized. "
             "Keys: [s/SPACE]=STOP, [c]=CLEAR, [q/Ctrl+C]=quit."
+        )
+        self.get_logger().info(
+            f"Ping monitoring: {', '.join(self.ping_targets)} "
+            f"(interval: {self.ping_interval}s)"
         )
 
     # ---- ROS helpers ----
@@ -79,6 +92,33 @@ class EstopCliNode(Node):
         self.estop_active = False
         self.publish_estop_state()
         self.get_logger().info("E-STOP CLEARED (CLI)")
+
+    # ---- Connectivity monitoring ----
+
+    def ping_host(self, host):
+        """Ping a host and return True if successful, False otherwise."""
+        try:
+            # Linux/Unix: ping -c 1 -W timeout_sec host
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", str(int(self.ping_timeout)), host],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=self.ping_timeout + 0.5,
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            self.get_logger().debug(f"Ping error for {host}: {e}")
+            return False
+
+    def check_connectivity(self):
+        """Check connectivity to all ping targets and trip estop if any fail."""
+        for target in self.ping_targets:
+            if not self.ping_host(target):
+                self.get_logger().warn(
+                    f"Connectivity check FAILED for {target} - ACTIVATING E-STOP"
+                )
+                self.activate_estop()
+                return
 
 
 def save_terminal_settings():
