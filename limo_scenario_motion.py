@@ -533,23 +533,23 @@ def main(argv=None):
         node.destroy_node()
         rclpy.shutdown()
 
-        # --------------------------------------------------------------
-        # Stop Data_Logger.py gracefully so the bag is finalized/renamed
-        # --------------------------------------------------------------
-        if logger_proc is not None:
-            try:
-                logger_proc.send_signal(signal.SIGINT)
-                try:
-                    logger_proc.wait(timeout=15.0)
-                except subprocess.TimeoutExpired:
-                    logger_proc.kill()
-                    logger_proc.wait()
-            except Exception as e:
-                print(
-                    f"[limo_scenario_motion] Warning: failed to stop "
-                    f"Data_Logger.py cleanly: {e}",
-                    file=sys.stderr,
-                )
+        # # --------------------------------------------------------------
+        # # Stop Data_Logger.py gracefully so the bag is finalized/renamed
+        # # --------------------------------------------------------------
+        # if logger_proc is not None:
+        #     try:
+        #         logger_proc.send_signal(signal.SIGINT)
+        #         try:
+        #             logger_proc.wait(timeout=15.0)
+        #         except subprocess.TimeoutExpired:
+        #             logger_proc.kill()
+        #             logger_proc.wait()
+        #     except Exception as e:
+        #         print(
+        #             f"[limo_scenario_motion] Warning: failed to stop "
+        #             f"Data_Logger.py cleanly: {e}",
+        #             file=sys.stderr,
+        #         )
 
 
 if __name__ == "__main__":
