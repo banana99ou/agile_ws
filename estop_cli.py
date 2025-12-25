@@ -24,11 +24,11 @@ import tty
 import subprocess
 import platform
 
-import rclpy
-from rclpy.node import Node
+import rclpy  # pyright: ignore[reportMissingImports]
+from rclpy.node import Node # pyright: ignore[reportMissingImports]
 
-from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool
+from geometry_msgs.msg import Twist # pyright: ignore[reportMissingImports]
+from std_msgs.msg import Bool # pyright: ignore[reportMissingImports]
 
 
 class EstopCliNode(Node):
