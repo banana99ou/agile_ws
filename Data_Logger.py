@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 
 """
-it should also save:
-    Estop state
-    Event flag from scenario runner
-    optional validity
+ROS 2 bag recorder wrapper with a health/recording indicator.
+
+Behavior:
+- Starts `ros2 bag record` for a fixed topic list.
+- Publishes a recording indicator + heartbeat so other tools can confirm recording is active.
+
+Notes:
+- This script is intended to be started/stopped by an orchestrator (e.g. run_scenarios_from_files.py).
+- Stopping is done via SIGINT (Ctrl+C semantics) so we can rename the bag folder with the actual duration.
 """
 
 import argparse
@@ -14,6 +19,11 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+
+import rclpy  # pyright: ignore[reportMissingImports]
+from rclpy.node import Node  # pyright: ignore[reportMissingImports]
+
+from std_msgs.msg import Bool, String  # pyright: ignore[reportMissingImports]
 
 
 TOPICS = [
@@ -25,7 +35,7 @@ TOPICS = [
     "/cmd_vel",
     "/cmd_vel_raw",
     "/imu",
-    "/estop",
+    "/estop"
 ]
 
 
@@ -36,6 +46,38 @@ def build_bag_name(scenario: str, duration_label: str) -> str:
     """
     stamp = datetime.now().strftime("%y_%m%d_%H%M")
     return f"{stamp}_{scenario}_{duration_label}.bag"
+
+
+class DataLoggerHealthNode(Node):
+    def __init__(self, scenario: str):
+        super().__init__("data_logger_health")
+        self._scenario = scenario
+
+        self._pub_recording = self.create_publisher(Bool, "/data_logger/recording", 10)
+        self._pub_health = self.create_publisher(String, "/data_logger/health", 10)
+
+        # Publish at 2 Hz while alive
+        self._timer = self.create_timer(0.5, self._tick)
+
+        self.recording_active = False
+        self.bag_path = ""
+        self.ros2_bag_pid = -1
+
+    def _tick(self):
+        # Publish recording flag
+        rec = Bool()
+        rec.data = bool(self.recording_active)
+        self._pub_recording.publish(rec)
+
+        # Publish health string (human readable)
+        msg = String()
+        msg.data = (
+            f"recording={1 if self.recording_active else 0} "
+            f"scenario={self._scenario} "
+            f"pid={self.ros2_bag_pid} "
+            f"bag_path={self.bag_path}"
+        )
+        self._pub_health.publish(msg)
 
 
 def main(argv=None) -> int:
@@ -78,30 +120,59 @@ def main(argv=None) -> int:
 
     start_monotonic = time.monotonic()
 
+    # Start ROS node for health publishing
+    rclpy.init(args=None)
+    node = DataLoggerHealthNode(scenario=scenario)
+    node.recording_active = False
+    node.bag_path = bag_path
+
     try:
         proc = subprocess.Popen(cmd)
     except FileNotFoundError:
         print("Error: 'ros2' command not found. Make sure your ROS 2 environment is sourced.", file=sys.stderr)
+        node.destroy_node()
+        rclpy.shutdown()
+        return 1
+    except Exception as e:
+        print(f"Error: failed to start ros2 bag record: {e}", file=sys.stderr)
+        node.destroy_node()
+        rclpy.shutdown()
         return 1
 
+    node.ros2_bag_pid = proc.pid or -1
+    node.recording_active = True
+    print(f"DATA_LOGGER_STARTED ros2_bag_pid={node.ros2_bag_pid}")
+
+    end_monotonic = None
     try:
-        proc.wait()
-        # Normal exit (no Ctrl+C). Use elapsed time anyway.
+        # Spin the health node while ros2 bag record runs.
+        while rclpy.ok() and proc.poll() is None:
+            rclpy.spin_once(node, timeout_sec=0.2)
         end_monotonic = time.monotonic()
     except KeyboardInterrupt:
-        # User pressed Ctrl+C; stop the ros2 bag process and measure duration.
+        # Stop request (Ctrl+C or orchestrator SIGINT)
         print("\nStopping ros2 bag recording...")
         try:
-            # Send SIGINT to ros2 bag process; if it's already exiting this is harmless.
             proc.send_signal(signal.SIGINT)
-        except ProcessLookupError:
+        except Exception:
             pass
-        finally:
-            try:
-                proc.wait(timeout=10.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+        try:
+            proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        end_monotonic = time.monotonic()
+    finally:
+        node.recording_active = False
+        try:
+            # Final publish
+            node._tick()
+        except Exception:
+            pass
+        node.destroy_node()
+        rclpy.shutdown()
+
+    if end_monotonic is None:
         end_monotonic = time.monotonic()
 
     duration_s = max(0, int(end_monotonic - start_monotonic))
