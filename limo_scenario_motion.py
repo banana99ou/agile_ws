@@ -499,7 +499,7 @@ def main(argv=None):
     #     sys.exit(1)
 
     # rclpy.init()
-    # node = OdomWatcher()
+    node = OdomWatcher()
 
     try:
         if args.scenario == "static":
