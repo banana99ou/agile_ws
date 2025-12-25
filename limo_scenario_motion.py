@@ -6,7 +6,7 @@ This script is intentionally small: it is the **motion module** used by a larger
 experiment system (see the repository root `README.md`).
 
 Role in the bigger system:
-- Publishes `cmd_vel` to execute simple motion scenarios (open-loop).
+- Publishes `cmd_vel_raw` to execute simple motion scenarios (open-loop).
 - Subscribes to `/wheel/odom` to estimate yaw/velocity and to apply a basic
   heading-hold correction while moving.
 
@@ -26,7 +26,7 @@ How to Use
    - Example: to drive forward 2m with yaw hold at 0.3 m/s:
         $ python3 limo_scenario_motion.py --distance 2.0 --speed 0.3
 
-4. The script will issue velocity commands (`cmd_vel`) to LIMO in open-loop or heading-hold modes,
+4. The script will issue velocity commands (`cmd_vel_raw`) to LIMO in open-loop or heading-hold modes,
    reading the current yaw/velocity from `/wheel/odom`.
 
 This script is for GNSS and re-fix timeline experiments and repeatable motion primitives.
@@ -498,7 +498,12 @@ def main(argv=None):
     #     )
     #     sys.exit(1)
 
-    # rclpy.init()
+    # Required when running this file directly (or via subprocess) as a ROS 2 node.
+    # Calling init() more than once in a process can raise; treat that as "already initialized".
+    try:
+        rclpy.init(args=None)
+    except RuntimeError:
+        pass
     node = OdomWatcher()
 
     try:
