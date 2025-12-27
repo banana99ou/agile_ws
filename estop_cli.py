@@ -23,6 +23,9 @@ import termios
 import tty
 import subprocess
 import platform
+import argparse
+import time
+from datetime import datetime
 
 import rclpy  # pyright: ignore[reportMissingImports]
 from rclpy.node import Node # pyright: ignore[reportMissingImports]
@@ -32,15 +35,33 @@ from std_msgs.msg import Bool # pyright: ignore[reportMissingImports]
 
 
 class EstopCliNode(Node):
-    def __init__(self):
+    def __init__(self, debug=False):
         super().__init__("limo_estop_cli")
 
+        self.debug = debug
         self.estop_active = False
-        self.ping_targets = ["google.com", "10.0.0.42"]
+        self.ping_targets = ["10.0.0.42"]
         # Track last known connectivity per host so we only log on state changes
         self.connectivity_status = {host: True for host in self.ping_targets}
+        self.failure_counts = {host: 0 for host in self.ping_targets}
+        self.total_misses = {host: 0 for host in self.ping_targets}
+        
+        # SENSITIVITY SETTINGS
         self.ping_interval = 1.0  # seconds
-        self.ping_timeout = 1.0  # seconds
+        self.ping_timeout = 1.0   # seconds
+        self.ping_threshold = 3    # consecutive failures before tripping
+
+        # Setup debug recording if enabled
+        self.debug_file = None
+        if self.debug:
+            filename = f"estop_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            try:
+                self.debug_file = open(filename, "w")
+                self.debug_file.write("timestamp,host,status,consecutive_misses,total_misses\n")
+                self.debug_file.flush()
+                self.get_logger().info(f"Debug recording enabled: {filename}")
+            except Exception as e:
+                self.get_logger().error(f"Failed to open debug file: {e}")
 
         self.estop_pub = self.create_publisher(Bool, "/estop", 10)
         self.cmd_vel_pub = self.create_publisher(Twist, "cmd_vel", 10)
@@ -115,33 +136,45 @@ class EstopCliNode(Node):
             self.get_logger().debug(f"Ping error for {host}: {e}")
             return False
     def check_connectivity(self):
-        """Check connectivity to all ping targets and trip E-stop on new failures.
-
-        This function now logs connectivity changes instead of spamming a warning
-        every timer cycle while a host remains down. Behavior:
-        - When a host first goes from OK -> FAIL: log WARN once and trip E-stop.
-        - While a host stays FAIL: no extra logs.
-        - When a host goes from FAIL -> OK: log INFO once.
-        """
+        """Check connectivity to all ping targets and trip E-stop on threshold."""
         for target in self.ping_targets:
             ok = self.ping_host(target)
-            prev_ok = self.connectivity_status.get(target, True)
+            
+            if not ok:
+                self.failure_counts[target] += 1
+                self.total_misses[target] += 1
+                
+                # Record to debug file if enabled
+                if self.debug and self.debug_file:
+                    timestamp = datetime.now().isoformat()
+                    self.debug_file.write(f"{timestamp},{target},FAIL,{self.failure_counts[target]},{self.total_misses[target]}\n")
+                    self.debug_file.flush()
 
-            # Only react when state changes to keep the CLI output readable
-            if ok != prev_ok:
-                print("\r") # Reset cursor to start of line before logging
-                if not ok:
+                # If we hit the threshold and we haven't already marked it as failed
+                if self.failure_counts[target] >= self.ping_threshold and self.connectivity_status[target]:
+                    print("\r")
                     self.get_logger().warn(
-                        f"Connectivity check FAILED for {target} - ACTIVATING E-STOP"
+                        f"Connectivity FAILED for {target} ({self.failure_counts[target]} misses) - ACTIVATING E-STOP"
                     )
-                    # Trip E-stop on the first detection of a failure
+                    self.connectivity_status[target] = False
                     self.activate_estop()
-                else:
-                    self.get_logger().info(
-                        f"Connectivity restored for {target}"
-                    )
+            else:
+                # If it was previously failed, log restoration
+                if not self.connectivity_status[target]:
+                    print("\r")
+                    self.get_logger().info(f"Connectivity restored for {target}")
+                
+                # Record restoration to debug file
+                if self.debug and self.debug_file and not ok: # This condition is slightly wrong, 'ok' is True here
+                    pass # Handled below
+                
+                if self.debug and self.debug_file and self.failure_counts[target] > 0:
+                    timestamp = datetime.now().isoformat()
+                    self.debug_file.write(f"{timestamp},{target},OK,0,{self.total_misses[target]}\n")
+                    self.debug_file.flush()
 
-            self.connectivity_status[target] = ok
+                self.connectivity_status[target] = True
+                self.failure_counts[target] = 0
 
 
 def save_terminal_settings():
@@ -152,10 +185,12 @@ def restore_terminal_settings(settings):
     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
 
 
-def print_help():
+def print_help(debug_enabled=False):
     """Print the help header."""
     print("\r\n" + "="*50)
     print("      LIMO E-STOP COMMAND LINE INTERFACE")
+    if debug_enabled:
+        print("                (DEBUG MODE)")
     print("="*50)
     print("  [s / SPACE] : ACTIVATE E-stop (LATCHED)")
     print("  [c]         : CLEAR E-stop")
@@ -170,9 +205,21 @@ def print_status_line(node):
     state_str = "\033[1;31m!!! E-STOP ACTIVE !!!\033[0m" if node.estop_active else "\033[1;32m[ OK: Motion Allowed ]\033[0m"
     
     ping_parts = []
-    for host, ok in node.connectivity_status.items():
+    for host in node.ping_targets:
+        ok = node.connectivity_status[host]
+        count = node.failure_counts[host]
+        total = node.total_misses[host]
         color = "\033[32m" if ok else "\033[31m"
-        ping_parts.append(f"{host}: {color}{'OK' if ok else 'FAIL'}\033[0m")
+        status_text = "OK" if ok else "FAIL"
+        
+        # Show misses if any (e.g. "FAIL (2/3 misses)")
+        miss_text = f" ({count}/{node.ping_threshold} misses)" if count > 0 else ""
+        
+        # In debug mode, show total misses as well
+        if node.debug:
+            miss_text += f" [Total: {total}]"
+            
+        ping_parts.append(f"{host}: {color}{status_text}{miss_text}\033[0m")
     
     status = f"\r[STATUS] {state_str} | Pings: {' | '.join(ping_parts)} \033[K"
     sys.stdout.write(status)
@@ -180,14 +227,19 @@ def print_status_line(node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = EstopCliNode()
+    # Parse custom arguments before ROS init
+    parser = argparse.ArgumentParser(description="LIMO E-stop CLI")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode (logging and extra status)")
+    parsed_args, ros_args = parser.parse_known_args(args)
+
+    rclpy.init(args=ros_args)
+    node = EstopCliNode(debug=parsed_args.debug)
 
     settings = save_terminal_settings()
     # setcbreak is better for CLIs than setraw as it handles some output mapping
     tty.setcbreak(sys.stdin.fileno())
 
-    print_help()
+    print_help(debug_enabled=parsed_args.debug)
 
     try:
         last_ui_update = 0
@@ -220,6 +272,10 @@ def main(args=None):
         
         # Move past the status line and restore terminal
         print("\r\n\n[Exiting E-STOP CLI] - E-stop remains ACTIVE for safety.\r\n")
+        
+        if node.debug_file:
+            node.debug_file.close()
+            
         restore_terminal_settings(settings)
         node.destroy_node()
         rclpy.shutdown()
