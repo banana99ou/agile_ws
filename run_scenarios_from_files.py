@@ -9,6 +9,13 @@ This script is a ROS 2 node (rclpy) that orchestrates:
 
 It publishes simple status/event strings for monitoring and subscribes to /estop
 to refuse/abort motion when E-stop is active.
+
+1. See all available levels:
+    python3 run_scenarios_from_files.py --list-levels
+2. Run a specific level (e.g., level_2):
+    python3 run_scenarios_from_files.py --level level_2
+3. Test the command without moving the robot (Dry Run):
+    python3 run_scenarios_from_files.py --level level_2 --dry-run
 """
 
 from __future__ import annotations
@@ -340,10 +347,10 @@ def main(argv: List[str] | None = None) -> int:
         description="Run limo_scenario_motion.py scenarios from INI description files (hardcoded)."
     )
     p.add_argument(
-        "--only",
+        "--scenario-type",
         choices=["const_vel", "const_acc", "both"],
         default="both",
-        help="Which scenario file(s) to run.",
+        help="Which scenario file(s) to search in.",
     )
     p.add_argument(
         "--dry-run",
@@ -351,21 +358,15 @@ def main(argv: List[str] | None = None) -> int:
         help="Print the commands that would run, but do not execute them.",
     )
     p.add_argument(
-        "--pause-s",
-        type=float,
-        default=None,
-        help="Override inter-run pause seconds (otherwise uses each file's [meta].inter_run_pause_s).",
-    )
-    p.add_argument(
         "--level",
         type=str,
         default=None,
-        help="Run only this level section name (e.g. 'level_2'). If omitted, runs all levels in the selected file(s).",
+        help="The level section name to run (e.g. 'level_2'). Required unless using --list-levels.",
     )
     p.add_argument(
         "--list-levels",
         action="store_true",
-        help="List available level section names and exit (filtered by --only).",
+        help="List available level section names and exit (filtered by --scenario-type).",
     )
     p.add_argument(
         "--no-record",
@@ -380,13 +381,17 @@ def main(argv: List[str] | None = None) -> int:
     )
     args = p.parse_args(argv)
 
+    if not args.list_levels and not args.level:
+        print("Error: --level <name> is required unless using --list-levels.")
+        return 1
+
     rclpy.init(args=None)
     node = ScenarioOrchestrator()
 
     files: List[Path] = []
-    if args.only in ("const_vel", "both"):
+    if args.scenario_type in ("const_vel", "both"):
         files.append(CONST_VEL_FILE)
-    if args.only in ("const_acc", "both"):
+    if args.scenario_type in ("const_acc", "both"):
         files.append(CONST_ACC_FILE)
 
     if not MOTION_SCRIPT.exists():
@@ -398,60 +403,66 @@ def main(argv: List[str] | None = None) -> int:
     try:
         node.event("RUN_START")
 
-        # If listing, gather names and exit.
+        # 1. If listing, gather names and exit.
         if args.list_levels:
             for path in files:
-                meta, calls, _ = load_scenario_file(path)
-                scenario_type = meta.get("type", "").strip()
-                print(f"{path.name} (type={scenario_type})")
-                for c in calls:
-                    print(f"  - {c.name}")
+                try:
+                    meta, calls, _ = load_scenario_file(path)
+                    scenario_type = meta.get("type", "").strip()
+                    print(f"{path.name} (type={scenario_type})")
+                    for c in calls:
+                        print(f"  - {c.name}")
+                except Exception as e:
+                    print(f"Error reading {path.name}: {e}")
             return 0
 
+        # 2. Find the specific requested level (across all allowed files).
+        target_call: Optional[Tuple[Path, str, ScenarioCall]] = None
         for path in files:
-            meta, calls, inter_pause = load_scenario_file(path)
-            pause_s = inter_pause if args.pause_s is None else float(args.pause_s)
-            scenario_type = meta.get("type", "").strip()
+            try:
+                meta, calls, _ = load_scenario_file(path)
+                scenario_type = meta.get("type", "").strip()
+                for c in calls:
+                    if c.name == args.level:
+                        target_call = (path, scenario_type, c)
+                        break
+                if target_call:
+                    break
+            except Exception:
+                continue
 
-            # Filter to a single requested level (intended workflow: run one level when ready).
-            if args.level:
-                calls = [c for c in calls if c.name == args.level]
-                if not calls:
-                    node.get_logger().error(
-                        f"Level '{args.level}' not found in {path.name}. Use --list-levels to see available."
-                    )
-                    return 5
+        if not target_call:
+            node.get_logger().error(
+                f"Level '{args.level}' not found in the selected file(s) ({args.scenario_type}). "
+                "Use --list-levels to see available names."
+            )
+            return 5
 
-            node.get_logger().info(f"Scenario file: {path.name} type={scenario_type}")
-            for i, call in enumerate(calls, start=1):
-                node.get_logger().info(f"[{i}/{len(calls)}] {call.name}")
-                node.get_logger().info(" ".join(call.argv))
-                node.status(f"phase=ready file={path.name} level={call.name}")
+        path, scenario_type, call = target_call
+        node.get_logger().info(f"Scenario file: {path.name} type={scenario_type}")
+        node.get_logger().info(f"Level: {call.name}")
+        node.get_logger().info("Command: " + " ".join(call.argv))
+        node.status(f"phase=ready file={path.name} level={call.name}")
 
-                if args.dry_run:
-                    continue
+        if args.dry_run:
+            node.get_logger().info("Dry run: not executing.")
+            return 0
 
-                try:
-                    rc = node.run_level(
-                        scenario_type=scenario_type,
-                        call=call,
-                        no_record=bool(args.no_record),
-                        record_startup_wait_s=float(args.record_startup_wait_s),
-                    )
-                except Exception as e:
-                    node.get_logger().error(f"Aborted level '{call.name}': {e}")
-                    return 4
+        # 3. Execute the single level
+        try:
+            rc = node.run_level(
+                scenario_type=scenario_type,
+                call=call,
+                no_record=bool(args.no_record),
+                record_startup_wait_s=float(args.record_startup_wait_s),
+            )
+        except Exception as e:
+            node.get_logger().error(f"Aborted level '{call.name}': {e}")
+            return 4
 
-                if rc != 0:
-                    node.get_logger().error(f"Error: scenario '{call.name}' failed with exit code {rc}")
-                    return rc
-
-                # If user requested a single level, do not pause or continue in this file.
-                if args.level:
-                    return 0
-
-                if pause_s > 0 and i != len(calls):
-                    node.spin_sleep(pause_s)
+        if rc != 0:
+            node.get_logger().error(f"Error: scenario '{call.name}' failed with exit code {rc}")
+            return rc
 
         node.event("RUN_END")
         return 0
