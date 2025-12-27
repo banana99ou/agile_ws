@@ -11,14 +11,6 @@ Behavior:
 - Publishes safe velocity commands on `cmd_vel`.
 - Publishes the E-stop state on `/estop` (std_msgs/Bool).
 
-External interface (for other nodes/clients):
-- `/estop/set` (std_srvs/SetBool):
-  - `data=True`  => ACTIVATE E-stop
-  - `data=False` => CLEAR E-stop (only if parameter `allow_remote_clear:=true`)
-- `/estop/activate` (std_srvs/Trigger): ACTIVATE E-stop
-- `/estop/clear` (std_srvs/Trigger): CLEAR E-stop (only if `allow_remote_clear:=true`)
-- `/estop_cmd` (std_msgs/Bool topic): True=ACTIVATE, False=CLEAR (only if `allow_remote_clear:=true`)
-
 Keys (in the terminal where this script runs):
   s or SPACE : ACTIVATE E-stop (latch, send zero cmd_vel)
   c          : CLEAR E-stop (allow motion again)
@@ -37,7 +29,6 @@ from rclpy.node import Node # pyright: ignore[reportMissingImports]
 
 from geometry_msgs.msg import Twist # pyright: ignore[reportMissingImports]
 from std_msgs.msg import Bool # pyright: ignore[reportMissingImports]
-from std_srvs.srv import SetBool, Trigger  # pyright: ignore[reportMissingImports]
 
 
 class EstopCliNode(Node):
@@ -45,32 +36,16 @@ class EstopCliNode(Node):
         super().__init__("limo_estop_cli")
 
         self.estop_active = False
-        self.allow_remote_clear = (
-            self.declare_parameter("allow_remote_clear", False).value
-        )
         self.ping_targets = ["google.com", "10.0.0.42"]
+        # Track last known connectivity per host so we only log on state changes
+        self.connectivity_status = {host: True for host in self.ping_targets}
         self.ping_interval = 1.0  # seconds
         self.ping_timeout = 1.0  # seconds
 
         self.estop_pub = self.create_publisher(Bool, "/estop", 10)
-        self.estop_cmd_sub = self.create_subscription(
-            Bool, "/estop_cmd", self.estop_cmd_callback, 10
-        )
         self.cmd_vel_pub = self.create_publisher(Twist, "cmd_vel", 10)
         self.cmd_vel_raw_sub = self.create_subscription(
             Twist, "cmd_vel_raw", self.cmd_vel_raw_callback, 10
-        )
-
-        # External interfaces (for other nodes/clients)
-        # - /estop/set (std_srvs/SetBool): data=True -> ACTIVATE, data=False -> CLEAR (optional)
-        # - /estop/activate (std_srvs/Trigger): ACTIVATE
-        # - /estop/clear (std_srvs/Trigger): CLEAR (optional)
-        self.estop_set_srv = self.create_service(SetBool, "/estop/set", self.on_estop_set)
-        self.estop_activate_srv = self.create_service(
-            Trigger, "/estop/activate", self.on_estop_activate
-        )
-        self.estop_clear_srv = self.create_service(
-            Trigger, "/estop/clear", self.on_estop_clear
         )
 
         # Create timer for periodic ping checks
@@ -81,14 +56,9 @@ class EstopCliNode(Node):
             "Keys: [s/SPACE]=STOP, [c]=CLEAR, [q/Ctrl+C]=quit."
         )
         self.get_logger().info(
-            "External E-stop interface: /estop (state), /estop/set (service), /estop_cmd (topic). "
-            f"Remote clear allowed: {self.allow_remote_clear}"
-        )
-        self.get_logger().info(
             f"Ping monitoring: {', '.join(self.ping_targets)} "
             f"(interval: {self.ping_interval}s)"
         )
-        self.publish_estop_state()
 
     # ---- ROS helpers ----
 
@@ -99,24 +69,6 @@ class EstopCliNode(Node):
 
     def publish_zero_cmd(self):
         self.cmd_vel_pub.publish(Twist())
-
-    def estop_cmd_callback(self, msg: Bool):
-        """
-        External command topic callback.
-
-        Topic: /estop_cmd (std_msgs/Bool)
-        - True  => activate E-stop
-        - False => clear E-stop (only if allow_remote_clear=True)
-        """
-        if msg.data:
-            self.activate_estop(source="topic:/estop_cmd")
-        else:
-            if self.allow_remote_clear:
-                self.clear_estop(source="topic:/estop_cmd")
-            else:
-                self.get_logger().warn(
-                    "Ignoring remote CLEAR via /estop_cmd (allow_remote_clear=false)"
-                )
 
     def cmd_vel_raw_callback(self, msg: Twist):
         """Filter raw velocity commands based on current E-stop state."""
@@ -129,55 +81,22 @@ class EstopCliNode(Node):
 
     # ---- E-stop control ----
 
-    def activate_estop(self, source: str = "local"):
+    def activate_estop(self):
         if not self.estop_active:
             self.estop_active = True
             self.publish_estop_state()
             self.publish_zero_cmd()
-            self.get_logger().warn(f"E-STOP ACTIVATED (CLI) source={source}")
+            # In raw/cbreak mode, we need \r\n for the logger to not staircase
+            print("\r") 
+            self.get_logger().warn("E-STOP ACTIVATED (CLI)")
 
-    def clear_estop(self, source: str = "local"):
+    def clear_estop(self):
         if not self.estop_active:
             return
         self.estop_active = False
         self.publish_estop_state()
-        self.get_logger().info(f"E-STOP CLEARED (CLI) source={source}")
-
-    # ---- External service handlers ----
-
-    def on_estop_set(self, request: SetBool.Request, response: SetBool.Response):
-        if request.data:
-            self.activate_estop(source="service:/estop/set")
-            response.success = True
-            response.message = "E-stop ACTIVATED"
-            return response
-
-        # request.data == False => clear request
-        if not self.allow_remote_clear:
-            response.success = False
-            response.message = "Remote CLEAR disabled (allow_remote_clear=false)"
-            return response
-
-        self.clear_estop(source="service:/estop/set")
-        response.success = True
-        response.message = "E-stop CLEARED"
-        return response
-
-    def on_estop_activate(self, request: Trigger.Request, response: Trigger.Response):
-        self.activate_estop(source="service:/estop/activate")
-        response.success = True
-        response.message = "E-stop ACTIVATED"
-        return response
-
-    def on_estop_clear(self, request: Trigger.Request, response: Trigger.Response):
-        if not self.allow_remote_clear:
-            response.success = False
-            response.message = "Remote CLEAR disabled (allow_remote_clear=false)"
-            return response
-        self.clear_estop(source="service:/estop/clear")
-        response.success = True
-        response.message = "E-stop CLEARED"
-        return response
+        print("\r")
+        self.get_logger().info("E-STOP CLEARED (CLI)")
 
     # ---- Connectivity monitoring ----
 
@@ -195,16 +114,34 @@ class EstopCliNode(Node):
         except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
             self.get_logger().debug(f"Ping error for {host}: {e}")
             return False
-    #! need to check if this function is or operation.
     def check_connectivity(self):
-        """Check connectivity to all ping targets and trip estop if any fail."""
+        """Check connectivity to all ping targets and trip E-stop on new failures.
+
+        This function now logs connectivity changes instead of spamming a warning
+        every timer cycle while a host remains down. Behavior:
+        - When a host first goes from OK -> FAIL: log WARN once and trip E-stop.
+        - While a host stays FAIL: no extra logs.
+        - When a host goes from FAIL -> OK: log INFO once.
+        """
         for target in self.ping_targets:
-            if not self.ping_host(target):
-                self.get_logger().warn(
-                    f"Connectivity check FAILED for {target} - ACTIVATING E-STOP"
-                )
-                self.activate_estop()
-                return
+            ok = self.ping_host(target)
+            prev_ok = self.connectivity_status.get(target, True)
+
+            # Only react when state changes to keep the CLI output readable
+            if ok != prev_ok:
+                print("\r") # Reset cursor to start of line before logging
+                if not ok:
+                    self.get_logger().warn(
+                        f"Connectivity check FAILED for {target} - ACTIVATING E-STOP"
+                    )
+                    # Trip E-stop on the first detection of a failure
+                    self.activate_estop()
+                else:
+                    self.get_logger().info(
+                        f"Connectivity restored for {target}"
+                    )
+
+            self.connectivity_status[target] = ok
 
 
 def save_terminal_settings():
@@ -215,25 +152,54 @@ def restore_terminal_settings(settings):
     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
 
 
+def print_help():
+    """Print the help header."""
+    print("\r\n" + "="*50)
+    print("      LIMO E-STOP COMMAND LINE INTERFACE")
+    print("="*50)
+    print("  [s / SPACE] : ACTIVATE E-stop (LATCHED)")
+    print("  [c]         : CLEAR E-stop")
+    print("  [q / Ctrl+C]: Quit (Leaves E-stop ACTIVE)")
+    print("-" * 50 + "\r\n")
+
+
+def print_status_line(node):
+    """Print a one-line live status bar at the bottom."""
+    # ANSI escape: \033[K clears the line from cursor to end
+    # \r moves to start of line
+    state_str = "\033[1;31m!!! E-STOP ACTIVE !!!\033[0m" if node.estop_active else "\033[1;32m[ OK: Motion Allowed ]\033[0m"
+    
+    ping_parts = []
+    for host, ok in node.connectivity_status.items():
+        color = "\033[32m" if ok else "\033[31m"
+        ping_parts.append(f"{host}: {color}{'OK' if ok else 'FAIL'}\033[0m")
+    
+    status = f"\r[STATUS] {state_str} | Pings: {' | '.join(ping_parts)} \033[K"
+    sys.stdout.write(status)
+    sys.stdout.flush()
+
+
 def main(args=None):
     rclpy.init(args=args)
     node = EstopCliNode()
 
     settings = save_terminal_settings()
-    tty.setraw(sys.stdin.fileno())
+    # setcbreak is better for CLIs than setraw as it handles some output mapping
+    tty.setcbreak(sys.stdin.fileno())
 
-    print("\n[E-STOP CLI]")
-    print("  s / SPACE : ACTIVATE E-stop (latch, send zero cmd_vel)")
-    print("  c         : CLEAR E-stop (allow motion again)")
-    print("  q / Ctrl+C: Quit (leaves E-stop ACTIVE)\n")
+    print_help()
 
     try:
+        last_ui_update = 0
         while rclpy.ok():
-            # Spin ROS briefly (non-blocking)
+            # Spin ROS briefly
             rclpy.spin_once(node, timeout_sec=0.0)
 
-            # Check if a key is available, with short timeout
-            rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+            # Update status line frequently
+            print_status_line(node)
+
+            # Check if a key is available
+            rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
             if rlist:
                 ch = sys.stdin.read(1)
 
@@ -247,10 +213,13 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        # On exit, enforce a safe state: E-stop active and zero cmd_vel
+        # On exit, enforce a safe state
         node.estop_active = True
         node.publish_estop_state()
         node.publish_zero_cmd()
+        
+        # Move past the status line and restore terminal
+        print("\r\n\n[Exiting E-STOP CLI] - E-stop remains ACTIVE for safety.\r\n")
         restore_terminal_settings(settings)
         node.destroy_node()
         rclpy.shutdown()
