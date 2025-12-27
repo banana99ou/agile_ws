@@ -11,6 +11,14 @@ Behavior:
 - Publishes safe velocity commands on `cmd_vel`.
 - Publishes the E-stop state on `/estop` (std_msgs/Bool).
 
+External interface (for other nodes/clients):
+- `/estop/set` (std_srvs/SetBool):
+  - `data=True`  => ACTIVATE E-stop
+  - `data=False` => CLEAR E-stop (only if parameter `allow_remote_clear:=true`)
+- `/estop/activate` (std_srvs/Trigger): ACTIVATE E-stop
+- `/estop/clear` (std_srvs/Trigger): CLEAR E-stop (only if `allow_remote_clear:=true`)
+- `/estop_cmd` (std_msgs/Bool topic): True=ACTIVATE, False=CLEAR (only if `allow_remote_clear:=true`)
+
 Keys (in the terminal where this script runs):
   s or SPACE : ACTIVATE E-stop (latch, send zero cmd_vel)
   c          : CLEAR E-stop (allow motion again)
@@ -29,6 +37,7 @@ from rclpy.node import Node # pyright: ignore[reportMissingImports]
 
 from geometry_msgs.msg import Twist # pyright: ignore[reportMissingImports]
 from std_msgs.msg import Bool # pyright: ignore[reportMissingImports]
+from std_srvs.srv import SetBool, Trigger  # pyright: ignore[reportMissingImports]
 
 
 class EstopCliNode(Node):
@@ -36,14 +45,32 @@ class EstopCliNode(Node):
         super().__init__("limo_estop_cli")
 
         self.estop_active = False
+        self.allow_remote_clear = (
+            self.declare_parameter("allow_remote_clear", False).value
+        )
         self.ping_targets = ["google.com", "10.0.0.42"]
         self.ping_interval = 1.0  # seconds
         self.ping_timeout = 1.0  # seconds
 
         self.estop_pub = self.create_publisher(Bool, "/estop", 10)
+        self.estop_cmd_sub = self.create_subscription(
+            Bool, "/estop_cmd", self.estop_cmd_callback, 10
+        )
         self.cmd_vel_pub = self.create_publisher(Twist, "cmd_vel", 10)
         self.cmd_vel_raw_sub = self.create_subscription(
             Twist, "cmd_vel_raw", self.cmd_vel_raw_callback, 10
+        )
+
+        # External interfaces (for other nodes/clients)
+        # - /estop/set (std_srvs/SetBool): data=True -> ACTIVATE, data=False -> CLEAR (optional)
+        # - /estop/activate (std_srvs/Trigger): ACTIVATE
+        # - /estop/clear (std_srvs/Trigger): CLEAR (optional)
+        self.estop_set_srv = self.create_service(SetBool, "/estop/set", self.on_estop_set)
+        self.estop_activate_srv = self.create_service(
+            Trigger, "/estop/activate", self.on_estop_activate
+        )
+        self.estop_clear_srv = self.create_service(
+            Trigger, "/estop/clear", self.on_estop_clear
         )
 
         # Create timer for periodic ping checks
@@ -54,9 +81,14 @@ class EstopCliNode(Node):
             "Keys: [s/SPACE]=STOP, [c]=CLEAR, [q/Ctrl+C]=quit."
         )
         self.get_logger().info(
+            "External E-stop interface: /estop (state), /estop/set (service), /estop_cmd (topic). "
+            f"Remote clear allowed: {self.allow_remote_clear}"
+        )
+        self.get_logger().info(
             f"Ping monitoring: {', '.join(self.ping_targets)} "
             f"(interval: {self.ping_interval}s)"
         )
+        self.publish_estop_state()
 
     # ---- ROS helpers ----
 
@@ -67,6 +99,24 @@ class EstopCliNode(Node):
 
     def publish_zero_cmd(self):
         self.cmd_vel_pub.publish(Twist())
+
+    def estop_cmd_callback(self, msg: Bool):
+        """
+        External command topic callback.
+
+        Topic: /estop_cmd (std_msgs/Bool)
+        - True  => activate E-stop
+        - False => clear E-stop (only if allow_remote_clear=True)
+        """
+        if msg.data:
+            self.activate_estop(source="topic:/estop_cmd")
+        else:
+            if self.allow_remote_clear:
+                self.clear_estop(source="topic:/estop_cmd")
+            else:
+                self.get_logger().warn(
+                    "Ignoring remote CLEAR via /estop_cmd (allow_remote_clear=false)"
+                )
 
     def cmd_vel_raw_callback(self, msg: Twist):
         """Filter raw velocity commands based on current E-stop state."""
@@ -79,19 +129,55 @@ class EstopCliNode(Node):
 
     # ---- E-stop control ----
 
-    def activate_estop(self):
+    def activate_estop(self, source: str = "local"):
         if not self.estop_active:
             self.estop_active = True
             self.publish_estop_state()
             self.publish_zero_cmd()
-            self.get_logger().warn("E-STOP ACTIVATED (CLI)")
+            self.get_logger().warn(f"E-STOP ACTIVATED (CLI) source={source}")
 
-    def clear_estop(self):
+    def clear_estop(self, source: str = "local"):
         if not self.estop_active:
             return
         self.estop_active = False
         self.publish_estop_state()
-        self.get_logger().info("E-STOP CLEARED (CLI)")
+        self.get_logger().info(f"E-STOP CLEARED (CLI) source={source}")
+
+    # ---- External service handlers ----
+
+    def on_estop_set(self, request: SetBool.Request, response: SetBool.Response):
+        if request.data:
+            self.activate_estop(source="service:/estop/set")
+            response.success = True
+            response.message = "E-stop ACTIVATED"
+            return response
+
+        # request.data == False => clear request
+        if not self.allow_remote_clear:
+            response.success = False
+            response.message = "Remote CLEAR disabled (allow_remote_clear=false)"
+            return response
+
+        self.clear_estop(source="service:/estop/set")
+        response.success = True
+        response.message = "E-stop CLEARED"
+        return response
+
+    def on_estop_activate(self, request: Trigger.Request, response: Trigger.Response):
+        self.activate_estop(source="service:/estop/activate")
+        response.success = True
+        response.message = "E-stop ACTIVATED"
+        return response
+
+    def on_estop_clear(self, request: Trigger.Request, response: Trigger.Response):
+        if not self.allow_remote_clear:
+            response.success = False
+            response.message = "Remote CLEAR disabled (allow_remote_clear=false)"
+            return response
+        self.clear_estop(source="service:/estop/clear")
+        response.success = True
+        response.message = "E-stop CLEARED"
+        return response
 
     # ---- Connectivity monitoring ----
 
