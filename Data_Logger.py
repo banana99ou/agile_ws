@@ -32,6 +32,7 @@ TOPICS = [
     "/gps_rtk_f9p_helical/gps/rtk_status",
     "/pixhawk/global_position/raw/satellites",
     "/pixhawk/global_position/raw/fix",
+    "/pixhawk/gpsstatus/gps1/raw",
     "/cmd_vel",
     "/cmd_vel_raw",
     "/imu",
