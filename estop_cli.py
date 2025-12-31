@@ -6,7 +6,7 @@ Terminal-based E-stop and safety filter for LIMO.
 Use this when you are SSH'ed into the robot and cannot open a GUI window.
 
 Behavior:
-- Checks connectivity to the MacBook control station (10.0.0.42) or internet (google.com) and trips the E-stop if it fails.
+- Checks connectivity to the MacBook control station (10.42.0.118) or internet (google.com) and trips the E-stop if it fails.
 - Subscribes to raw velocity commands on `cmd_vel_raw`.
 - Publishes safe velocity commands on `cmd_vel`.
 - Publishes the E-stop state on `/estop` (std_msgs/Bool).
@@ -25,6 +25,7 @@ import subprocess
 import platform
 import argparse
 import time
+import threading
 from datetime import datetime
 
 import rclpy  # pyright: ignore[reportMissingImports]
@@ -40,7 +41,7 @@ class EstopCliNode(Node):
 
         self.debug = debug
         self.estop_active = False
-        self.ping_targets = ["10.0.0.42"]
+        self.ping_targets = ["10.42.0.118"]
         # Track last known connectivity per host so we only log on state changes
         self.connectivity_status = {host: True for host in self.ping_targets}
         self.failure_counts = {host: 0 for host in self.ping_targets}
@@ -69,8 +70,9 @@ class EstopCliNode(Node):
             Twist, "cmd_vel_raw", self.cmd_vel_raw_callback, 10
         )
 
-        # Create timer for periodic ping checks
-        self.ping_timer = self.create_timer(self.ping_interval, self.check_connectivity)
+        # Create background thread for periodic ping checks
+        self.ping_thread = threading.Thread(target=self._ping_loop, daemon=True)
+        self.ping_thread.start()
 
         self.get_logger().info(
             "LIMO E-stop CLI initialized. "
@@ -175,6 +177,12 @@ class EstopCliNode(Node):
 
                 self.connectivity_status[target] = True
                 self.failure_counts[target] = 0
+
+    def _ping_loop(self):
+        """Background loop to run pings without blocking ROS callbacks."""
+        while rclpy.ok():
+            self.check_connectivity()
+            time.sleep(self.ping_interval)
 
 
 def save_terminal_settings():
