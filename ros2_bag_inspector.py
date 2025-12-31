@@ -14,7 +14,8 @@ Examples:
     python3 ros2_bag_inspector.py list /path/to/bag_directory
 
   Export one topic to CSV:
-    python3 ros2_bag_inspector.py export /path/to/bag_directory --topic /your/topic/name --out topic_data.csv
+    python3 ros2_bag_inspector.py export /path/to/bag_directory --topic /your/topic/name
+    python3 ros2_bag_inspector.py export /path/to/bag_directory --topic /your/topic/name --out my_custom_name.csv
 """
 
 import argparse
@@ -39,6 +40,44 @@ except ImportError as exc:
         "  source install/setup.bash (if you have a workspace)\n"
     )
     raise
+
+
+def _sanitize_for_filename(value: str) -> str:
+    """
+    Convert an arbitrary string (like a ROS topic name) into a safe filename fragment.
+    Keeps alnum, dash, underscore, dot. Converts everything else to underscore.
+    """
+    value = (value or "").strip()
+    if not value:
+        return "unknown"
+    # avoid leading dots which can create hidden files
+    value = value.lstrip(".")
+    if not value:
+        return "unknown"
+    out_chars = []
+    for ch in value:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            out_chars.append(ch)
+        else:
+            out_chars.append("_")
+    # collapse runs of underscores
+    out = "".join(out_chars)
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_") or "unknown"
+
+
+def _default_export_csv_path(bag_path: str, topic_name: str) -> str:
+    bag_base = os.path.basename(os.path.normpath(bag_path)) or "bag"
+    bag_part = _sanitize_for_filename(bag_base)
+    topic_part = _sanitize_for_filename(topic_name.lstrip("/"))
+    return f"{bag_part}__{topic_part}.csv"
+
+
+def _default_export_all_csv_path(bag_path: str) -> str:
+    bag_base = os.path.basename(os.path.normpath(bag_path)) or "bag"
+    bag_part = _sanitize_for_filename(bag_base)
+    return f"{bag_part}__all_topics.csv"
 
 
 def _detect_storage_id(bag_path: str) -> str:
@@ -268,8 +307,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p_export.add_argument(
         "--out",
-        required=True,
-        help="Output CSV file path (e.g. topic_data.csv).",
+        default=None,
+        help=(
+            "Output CSV file path. If omitted, defaults to "
+            "<bag_name>__<topic_name>.csv in the current directory."
+        ),
     )
 
     # export-all command
@@ -283,8 +325,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p_export_all.add_argument(
         "--out",
-        required=True,
-        help="Output CSV file path (e.g. all_topics.csv).",
+        default=None,
+        help=(
+            "Output CSV file path. If omitted, defaults to "
+            "<bag_name>__all_topics.csv in the current directory."
+        ),
     )
 
     return parser.parse_args(argv)
@@ -296,9 +341,11 @@ def main(argv=None) -> None:
     if args.command == "list":
         list_bag_topics(args.bag_path)
     elif args.command == "export":
-        export_topic_to_csv(args.bag_path, args.topic, args.out)
+        out_csv = args.out or _default_export_csv_path(args.bag_path, args.topic)
+        export_topic_to_csv(args.bag_path, args.topic, out_csv)
     elif args.command == "export-all":
-        export_all_topics_to_csv(args.bag_path, args.out)
+        out_csv = args.out or _default_export_all_csv_path(args.bag_path)
+        export_all_topics_to_csv(args.bag_path, out_csv)
     else:
         raise RuntimeError(f"Unknown command: {args.command}")
 
