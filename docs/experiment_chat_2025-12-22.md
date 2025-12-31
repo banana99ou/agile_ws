@@ -26,8 +26,8 @@ prevent loss of context.
 ### Fix flag / state semantics (important)
 
 - Client-provided ranked flags (best → worst):
-  - **R** (RTK Float)
   - **F** (RTK Fix)
+  - **R** (RTK Float)
   - **D** (Differential)
   - **3D** (3D fix)
   - **2D** (2D fix)
