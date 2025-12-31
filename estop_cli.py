@@ -48,9 +48,9 @@ class EstopCliNode(Node):
         self.total_misses = {host: 0 for host in self.ping_targets}
         
         # SENSITIVITY SETTINGS
-        self.ping_interval = 1.0  # seconds
-        self.ping_timeout = 1.0   # seconds
-        self.ping_threshold = 3    # consecutive failures before tripping
+        self.ping_interval  = 0.5  # seconds
+        self.ping_timeout   = 1.0   # seconds
+        self.ping_threshold = 5    # consecutive failures before tripping
 
         # Setup debug recording if enabled
         self.debug_file = None
