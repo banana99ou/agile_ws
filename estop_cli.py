@@ -41,7 +41,7 @@ class EstopCliNode(Node):
 
         self.debug = debug
         self.estop_active = False
-        self.ping_targets = ["10.42.0.118"]
+        self.ping_targets = ["10.42.0.175"]
         # Track last known connectivity per host so we only log on state changes
         self.connectivity_status = {host: True for host in self.ping_targets}
         self.failure_counts = {host: 0 for host in self.ping_targets}
