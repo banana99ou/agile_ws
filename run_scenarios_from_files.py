@@ -12,7 +12,7 @@ to refuse/abort motion when E-stop is active.
 
 1. See all available levels:
     python3 run_scenarios_from_files.py --list-levels
-2. Run a specific level (e.g., level_2):
+2. Run a specific level (e.g., level_2 or open_sky_1):
     python3 run_scenarios_from_files.py --level level_2
 3. Test the command without moving the robot (Dry Run):
     python3 run_scenarios_from_files.py --level level_2 --dry-run
@@ -42,6 +42,7 @@ DATA_LOGGER_SCRIPT = ROOT / "Data_Logger.py"
 # Hardcoded scenario description files (as requested)
 CONST_VEL_FILE = ROOT / "scenarios" / "const_vel_scenarios.ini"
 CONST_ACC_FILE = ROOT / "scenarios" / "const_acc_scenarios.ini"
+STATIC_FILE    = ROOT / "scenarios" / "static_scenarios.ini"
 
 
 @dataclass(frozen=True)
@@ -93,7 +94,7 @@ def _get_str(section: configparser.SectionProxy, key: str) -> str:
     return str(v).strip()
 
 
-def load_scenario_file(path: Path) -> Tuple[Dict[str, str], List[ScenarioCall], float]:
+def load_scenario_file(path: Path, max_dist: Optional[float] = None) -> Tuple[Dict[str, str], List[ScenarioCall], float]:
     if not path.exists():
         raise FileNotFoundError(f"Scenario file not found: {path}")
 
@@ -136,6 +137,10 @@ def load_scenario_file(path: Path) -> Tuple[Dict[str, str], List[ScenarioCall], 
 
         distance_m = _get_float(s, "distance_m")
 
+        # Option 1: Apply global max distance cap
+        if max_dist is not None and distance_m > max_dist:
+            distance_m = max_dist
+
         argv = [
             sys.executable,
             str(MOTION_SCRIPT),
@@ -149,7 +154,11 @@ def load_scenario_file(path: Path) -> Tuple[Dict[str, str], List[ScenarioCall], 
             f"{max_duration_s}",
         ]
 
-        if scenario_type == "const_vel":
+        if scenario_type == "static":
+            heading_deg = _get_float(s, "heading_deg")
+            argv += ["--heading-deg", f"{heading_deg}"]
+
+        elif scenario_type == "const_vel":
             speed_mps = _get_float(s, "speed_mps")
             vel_tol = meta.getfloat("default_vel_tolerance", fallback=0.05)
             vel_tol_opt = _get_optional_float(s, "vel_tolerance")
@@ -253,8 +262,16 @@ class ScenarioOrchestrator(Node):
         self.estop_active = False
         self.create_subscription(Bool, "/estop", self._on_estop, 10)
 
+        self.soft_stop_active = False
+        self.create_subscription(Bool, "/scenario_runner/soft_stop", self._on_soft_stop, 10)
+
     def _on_estop(self, msg: Bool):
         self.estop_active = bool(msg.data)
+
+    def _on_soft_stop(self, msg: Bool):
+        if msg.data:
+            self.soft_stop_active = True
+            self.get_logger().info("Soft stop requested via topic")
 
     def status(self, text: str):
         m = String()
@@ -273,9 +290,10 @@ class ScenarioOrchestrator(Node):
 
     def run_motion_subprocess(self, argv: List[str]) -> int:
         """
-        Run a motion level and keep spinning so /estop can be observed.
+        Run a motion level and keep spinning so /estop or soft stop can be observed.
         If estop becomes active, attempt to stop the motion process.
         """
+        self.soft_stop_active = False  # Reset for each run
         proc = subprocess.Popen(argv)
         try:
             while rclpy.ok() and proc.poll() is None:
@@ -289,6 +307,14 @@ class ScenarioOrchestrator(Node):
                             proc.terminate()
                         except Exception:
                             pass
+                    break
+
+                if self.soft_stop_active:
+                    self.get_logger().info("Soft stop active; terminating motion subprocess")
+                    try:
+                        proc.send_signal(signal.SIGINT)
+                    except Exception:
+                        pass
                     break
 
             try:
@@ -334,6 +360,9 @@ class ScenarioOrchestrator(Node):
 
             self.status(f"phase=running level={label}")
             rc = self.run_motion_subprocess(call.argv)
+
+            if self.soft_stop_active:
+                self.event(f"LEVEL_SOFT_STOP {label}")
             return rc
         finally:
             self.status(f"phase=stopping level={label}")
@@ -348,8 +377,8 @@ def main(argv: List[str] | None = None) -> int:
     )
     p.add_argument(
         "--scenario-type",
-        choices=["const_vel", "const_acc", "both"],
-        default="both",
+        choices=["static", "const_vel", "const_acc", "all"],
+        default="all",
         help="Which scenario file(s) to search in.",
     )
     p.add_argument(
@@ -379,6 +408,12 @@ def main(argv: List[str] | None = None) -> int:
         default=1.0,
         help="Precaution-only: wait this many seconds and confirm Data_Logger.py process stays alive before motion starts.",
     )
+    p.add_argument(
+        "--max-dist",
+        type=float,
+        default=30,
+        help="Hard cap on distance (m) for any scenario. Overrides .ini file distance if smaller.",
+    )
     args = p.parse_args(argv)
 
     if not args.list_levels and not args.level:
@@ -389,9 +424,11 @@ def main(argv: List[str] | None = None) -> int:
     node = ScenarioOrchestrator()
 
     files: List[Path] = []
-    if args.scenario_type in ("const_vel", "both"):
+    if args.scenario_type in ("static", "all"):
+        files.append(STATIC_FILE)
+    if args.scenario_type in ("const_vel", "all"):
         files.append(CONST_VEL_FILE)
-    if args.scenario_type in ("const_acc", "both"):
+    if args.scenario_type in ("const_acc", "all"):
         files.append(CONST_ACC_FILE)
 
     if not MOTION_SCRIPT.exists():
@@ -407,7 +444,7 @@ def main(argv: List[str] | None = None) -> int:
         if args.list_levels:
             for path in files:
                 try:
-                    meta, calls, _ = load_scenario_file(path)
+                    meta, calls, _ = load_scenario_file(path, max_dist=args.max_dist)
                     scenario_type = meta.get("type", "").strip()
                     print(f"{path.name} (type={scenario_type})")
                     for c in calls:
@@ -420,7 +457,7 @@ def main(argv: List[str] | None = None) -> int:
         target_call: Optional[Tuple[Path, str, ScenarioCall]] = None
         for path in files:
             try:
-                meta, calls, _ = load_scenario_file(path)
+                meta, calls, _ = load_scenario_file(path, max_dist=args.max_dist)
                 scenario_type = meta.get("type", "").strip()
                 for c in calls:
                     if c.name == args.level:

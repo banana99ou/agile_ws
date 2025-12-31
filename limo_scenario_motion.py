@@ -223,6 +223,7 @@ class OdomWatcher(Node):
             rclpy.spin_once(self, timeout_sec=0.0)
 
             if self.last_x is None or self.last_y is None or self.last_yaw is None:
+                self.get_logger().warn("Waiting for /wheel/odom update...", throttle_duration_sec=1.0)
                 continue
 
             dx = self.last_x - start_x
@@ -320,6 +321,7 @@ class OdomWatcher(Node):
             rclpy.spin_once(self, timeout_sec=0.0)
 
             if self.last_x is None or self.last_y is None or self.last_yaw is None:
+                self.get_logger().warn("Waiting for /wheel/odom update...", throttle_duration_sec=1.0)
                 continue
 
             dx = self.last_x - start_x
@@ -510,6 +512,7 @@ def main(argv=None):
         if args.scenario == "static":
             node.run_static_heading(
                 heading_deg=args.heading_deg,
+                hold_time=args.max_duration,
                 rate_hz=args.rate_hz,
             )
         elif args.scenario == "const_vel":
