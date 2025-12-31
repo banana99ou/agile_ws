@@ -62,6 +62,14 @@ class DataLoggerHealthNode(Node):
         self.recording_active = False
         self.bag_path = ""
         self.ros2_bag_pid = -1
+        self.soft_stop_received = False
+
+        self.create_subscription(Bool, "/scenario_runner/soft_stop", self._on_soft_stop, 10)
+
+    def _on_soft_stop(self, msg: Bool):
+        if msg.data:
+            self.soft_stop_received = True
+            self.get_logger().info("Soft stop received; bag will be marked with _SOFTSTOP")
 
     def _tick(self):
         # Publish recording flag
@@ -177,6 +185,8 @@ def main(argv=None) -> int:
 
     duration_s = max(0, int(end_monotonic - start_monotonic))
     duration_label = f"{duration_s}s"
+    if node.soft_stop_received:
+        duration_label += "_SOFTSTOP"
     final_bag_name = build_bag_name(scenario, duration_label)
     final_bag_path = os.path.join(base_dir, final_bag_name)
 
