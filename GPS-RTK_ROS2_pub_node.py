@@ -35,6 +35,9 @@ import socket
 import serial
 import time
 import pynmea2
+import csv
+import os
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -49,11 +52,15 @@ from std_msgs.msg import String
 SERIAL_PORT = "/dev/f9p_helical"
 SERIAL_BAUD = 57600
 
-TCP_HOST = "10.0.0.42"
+TCP_HOST = "10.42.0.118"
 TCP_PORT = 2101
 
 STATUS_PRINT_INTERVAL = 1.0   # seconds
 RTCM_STALE_SECONDS = 5.0      # consider RTCM stale after this
+
+# Generate unique log file for this run
+_timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+RTCM_LOG_FILE = f"rtcm_log_{_timestamp_str}.csv"
 
 # -------------- STATE --------------
 
@@ -281,28 +288,72 @@ class HelicalGpsNode(Node):
 
 def rtcm_forwarder(ser_mgr: SerialManager, rtcm_status: RTCMStatus, stop_event: threading.Event):
     """Connect to your TCP RTCM broadcaster and pump bytes into F9P."""
+    # Initialize the log file with a header
+    if not os.path.exists(RTCM_LOG_FILE):
+        with open(RTCM_LOG_FILE, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "event", "bytes", "interval_s", "rtcm_preamble_found"])
+
+    last_rx_time = time.time()
+
     while not stop_event.is_set():
         try:
             print(f"[RTCM] Connecting to {TCP_HOST}:{TCP_PORT} ...")
-            with socket.create_connection((TCP_HOST, TCP_PORT), timeout=10) as sock:
-                sock.settimeout(5.0)
-                print("[RTCM] Connected. Receiving RTCM3 and forwarding to F9P...")
+            
+            with open(RTCM_LOG_FILE, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([datetime.now().isoformat(), "CONNECTING", 0, 0, "-"])
+                f.flush()
 
-                while not stop_event.is_set():
-                    try:
-                        data = sock.recv(4096)
-                        if not data:
-                            print("[RTCM] Connection closed by remote.")
-                            break
-                        # Feed F9P: this is where RTCM3 actually goes into the Helical
-                        ser_mgr.write(data)
+                with socket.create_connection((TCP_HOST, TCP_PORT), timeout=10) as sock:
+                    sock.settimeout(2.0) # Catch gaps quickly
+                    print("[RTCM] Connected. Receiving RTCM3 and forwarding to F9P...")
+                    writer.writerow([datetime.now().isoformat(), "CONNECTED", 0, 0, "-"])
+                    f.flush()
 
-                        rtcm_status.total_bytes += len(data)
-                        rtcm_status.last_rx_time = time.time()
-                    except socket.timeout:
-                        # No data in this interval; just loop
-                        continue
+                    while not stop_event.is_set():
+                        try:
+                            data = sock.recv(4096)
+                            now = time.time()
+
+                            if not data:
+                                writer.writerow([datetime.fromtimestamp(now).isoformat(), "DISCONNECTED", 0, 0, "-"])
+                                f.flush()
+                                print("[RTCM] Connection closed by remote.")
+                                break
+
+                            # Calculate metrics
+                            interval = now - last_rx_time
+                            last_rx_time = now
+                            
+                            # Simple RTCM3 validity check (preamble 0xd3)
+                            has_preamble = 0xd3 in data
+                            
+                            # Log metadata
+                            writer.writerow([
+                                datetime.fromtimestamp(now).isoformat(),
+                                "DATA_RX",
+                                len(data),
+                                f"{interval:.4f}",
+                                has_preamble
+                            ])
+                            f.flush()
+
+                            # Feed F9P: this is where RTCM3 actually goes into the Helical
+                            ser_mgr.write(data)
+
+                            rtcm_status.total_bytes += len(data)
+                            rtcm_status.last_rx_time = now
+                        except socket.timeout:
+                            # This is a gap in the stream
+                            writer.writerow([datetime.now().isoformat(), "TIMEOUT_GAP", 0, 2.0, False])
+                            f.flush()
+                            continue
         except (socket.error, OSError) as e:
+            with open(RTCM_LOG_FILE, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([datetime.now().isoformat(), "CONN_ERROR", 0, 0, str(e)])
+                f.flush()
             print(f"[RTCM] Connection error: {e}. Retrying in 5s...")
             time.sleep(5)
 
