@@ -13,7 +13,7 @@ nmcli radio wifi on
 # 2. Force apply the Apple-compatibility fix (PMF=1 means disabled)
 # This acts as a 'safety check' in case the settings were ever reset.
 sudo nmcli connection modify "$CON_NAME" 802-11-wireless-security.pmf 1
-
+sudo iw reg set KR
 # 3. Bring the connection up
 # We use 'down' first to ensure a fresh handshake
 sudo nmcli connection down "$CON_NAME" 2>/dev/null
