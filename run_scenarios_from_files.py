@@ -411,7 +411,7 @@ def main(argv: List[str] | None = None) -> int:
     p.add_argument(
         "--max-dist",
         type=float,
-        default=30,
+        default=20,
         help="Hard cap on distance (m) for any scenario. Overrides .ini file distance if smaller.",
     )
     args = p.parse_args(argv)
