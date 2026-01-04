@@ -10,7 +10,7 @@ ublox_gps_node:
 
     # Navigation rates
     # For F9P HPG firmware, nav_rate must be 1 Hz, "rate" is the measurement rate multiplier.
-    rate: 1.0       # Hz navPVT update rate
+    rate: 10.0       # Hz navPVT update rate
     nav_rate: 1
 
     # TMODE3: operating mode
