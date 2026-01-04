@@ -243,6 +243,10 @@ def main(args=None):
     rclpy.init(args=ros_args)
     node = EstopCliNode(debug=parsed_args.debug)
 
+    # Spin ROS2 in a background thread so terminal UI/input doesn't throttle message frequency
+    ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    ros_thread.start()
+
     settings = save_terminal_settings()
     # setcbreak is better for CLIs than setraw as it handles some output mapping
     tty.setcbreak(sys.stdin.fileno())
@@ -252,9 +256,6 @@ def main(args=None):
     try:
         last_ui_update = 0
         while rclpy.ok():
-            # Spin ROS briefly
-            rclpy.spin_once(node, timeout_sec=0.0)
-
             # Update status line frequently
             print_status_line(node)
 
