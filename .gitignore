@@ -47,3 +47,5 @@ ohcoach-cell-tools/FTG/
 
 estop_debug_*.csv
 rtcm_log_*.csv
+./plots_all_2026-01-03
+./exports_all_2026-01-03
