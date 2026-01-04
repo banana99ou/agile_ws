@@ -387,6 +387,154 @@ class OdomWatcher(Node):
         self.stop_robot()
         logger.info("[const_acc] Scenario finished.")
 
+    # ------------- scenario: circular -------------
+
+    def run_circular(
+        self,
+        speed: float,
+        radius: float,
+        distance: float,
+        max_duration: float = 60.0,
+        rate_hz: float = 20.0,
+    ):
+        """
+        Move in a circular path with constant speed and radius.
+        omega = speed / radius
+        """
+        logger = self.get_logger()
+
+        if radius == 0.0:
+            logger.error("Radius cannot be zero for circular scenario.")
+            return
+
+        if not self.wait_for_odom():
+            logger.error("No odom; cannot run circular scenario.")
+            return
+
+        start_x = self.last_x
+        start_y = self.last_y
+        dt = 1.0 / rate_hz
+        omega = speed / radius
+        
+        logger.info(
+            f"[circular] distance={distance:.2f} m, speed={speed:.2f} m/s, "
+            f"radius={radius:.2f} m, omega={omega:.3f} rad/s"
+        )
+
+        start_wall_time = time.time()
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.0)
+
+            if self.last_x is None or self.last_y is None:
+                self.get_logger().warn("Waiting for /wheel/odom update...", throttle_duration_sec=1.0)
+                continue
+
+            dx = self.last_x - start_x
+            dy = self.last_y - start_y
+            dist = math.sqrt(dx * dx + dy * dy)
+
+            # For circular, 'distance' is used as arc length approx if it's small, 
+            # but usually we want to cover a certain distance along the path.
+            # Here we just use Euclidean distance from start as a simple exit condition if requested,
+            # but better might be to use total traveled distance or time.
+            # User didn't specify, so we'll use a simple time-based or distance-based approach.
+            # If distance is provided, we use it as total path length.
+            
+            elapsed = time.time() - start_wall_time
+            traveled = speed * elapsed
+            
+            if distance > 0 and traveled >= distance:
+                logger.info(f"[circular] Reached distance: traveled={traveled:.3f} m")
+                break
+
+            if elapsed > max_duration:
+                logger.warn(f"[circular] Max duration {max_duration:.1f} s exceeded; stopping.")
+                break
+
+            twist = Twist()
+            twist.linear.x = speed
+            twist.angular.z = omega
+            self.pub.publish(twist)
+
+            time.sleep(dt)
+
+        self.stop_robot()
+        logger.info("[circular] Scenario finished.")
+
+    # ------------- scenario: s_curve -------------
+
+    def run_s_curve(
+        self,
+        distance: float,
+        max_duration: float = 60.0,
+        rate_hz: float = 20.0,
+    ):
+        """
+        Follow S-curve path:
+        x(t) = 20 * sin(0.2 * t)
+        y(t) = 10 * sin(0.4 * t)
+        
+        Commands:
+        vx(t) = 4 * cos(0.2 * t)
+        vy(t) = 4 * cos(0.4 * t)
+        ax(t) = -0.8 * sin(0.2 * t)
+        ay(t) = -1.6 * sin(0.4 * t)
+        
+        v(t) = sqrt(vx^2 + vy^2)
+        w(t) = (vx*ay - vy*ax) / (vx^2 + vy^2)
+        """
+        logger = self.get_logger()
+
+        if not self.wait_for_odom():
+            logger.error("No odom; cannot run s_curve scenario.")
+            return
+
+        dt = 1.0 / rate_hz
+        start_wall_time = time.time()
+        
+        logger.info(f"[s_curve] distance={distance:.2f} m, max_duration={max_duration:.2f} s")
+
+        total_traveled = 0.0
+        
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.0)
+
+            elapsed = time.time() - start_wall_time
+            
+            if elapsed > max_duration:
+                logger.warn(f"[s_curve] Max duration {max_duration:.1f} s exceeded; stopping.")
+                break
+
+            t = elapsed
+            vx = 4.0 * math.cos(0.2 * t)
+            vy = 4.0 * math.cos(0.4 * t)
+            ax = -0.8 * math.sin(0.2 * t)
+            ay = -1.6 * math.sin(0.4 * t)
+            
+            v_sq = vx*vx + vy*vy
+            v = math.sqrt(v_sq)
+            
+            if v_sq > 1e-6:
+                omega = (vx * ay - vy * ax) / v_sq
+            else:
+                omega = 0.0
+
+            total_traveled += v * dt
+            if distance > 0 and total_traveled >= distance:
+                logger.info(f"[s_curve] Reached distance: traveled={total_traveled:.3f} m")
+                break
+
+            twist = Twist()
+            twist.linear.x = v
+            twist.angular.z = omega
+            self.pub.publish(twist)
+
+            time.sleep(dt)
+
+        self.stop_robot()
+        logger.info("[s_curve] Scenario finished.")
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
@@ -397,7 +545,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--scenario",
         type=str,
-        choices=["static", "const_vel", "const_acc"],
+        choices=["static", "const_vel", "const_acc", "circular", "s_curve"],
         required=True,
         help="Scenario type to run.",
     )
@@ -410,18 +558,24 @@ def parse_args(argv=None):
         help="Target heading in degrees (odom frame) for static scenario.",
     )
 
-    # const_vel params
+    # const_vel / circular params
     parser.add_argument(
         "--speed",
         type=float,
         default=0.3,
-        help="Forward speed (m/s) for const_vel scenario.",
+        help="Forward speed (m/s) for const_vel/circular scenario.",
     )
     parser.add_argument(
         "--distance",
         type=float,
         default=1.0,
-        help="Distance (m) to travel for const_vel/const_acc scenarios.",
+        help="Distance (m) to travel for const_vel/const_acc/circular/s_curve scenarios.",
+    )
+    parser.add_argument(
+        "--radius",
+        type=float,
+        default=1.0,
+        help="Radius (m) for circular scenario. Positive = left, Negative = right.",
     )
     parser.add_argument(
         "--vel-tolerance",
@@ -529,6 +683,20 @@ def main(argv=None):
                 distance=args.distance,
                 max_speed=args.max_speed,
                 acc_tolerance=args.acc_tolerance,
+                max_duration=args.max_duration,
+                rate_hz=args.rate_hz,
+            )
+        elif args.scenario == "circular":
+            node.run_circular(
+                speed=args.speed,
+                radius=args.radius,
+                distance=args.distance,
+                max_duration=args.max_duration,
+                rate_hz=args.rate_hz,
+            )
+        elif args.scenario == "s_curve":
+            node.run_s_curve(
+                distance=args.distance,
                 max_duration=args.max_duration,
                 rate_hz=args.rate_hz,
             )
