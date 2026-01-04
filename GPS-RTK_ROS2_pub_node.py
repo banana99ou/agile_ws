@@ -67,6 +67,7 @@ class GNSSStatus:
     num_sats: int = 0
     hdop: Optional[float] = None
     last_gps_time: float = field(default_factory=time.time)
+    msg_count: int = 0
 
 @dataclass
 class RTCMStatus:
@@ -167,6 +168,9 @@ class HelicalGpsNode(Node):
         self.rtcm_status = RTCMStatus()
         self._stop_event = threading.Event()
 
+        self.last_msg_count = 0
+        self.last_status_time = time.time()
+
         # Publishers
         self.fix_pub = self.create_publisher(NavSatFix, "gps/fix", 10)
         self.nmea_pub = self.create_publisher(String, "gps/nmea", 10)
@@ -219,6 +223,15 @@ class HelicalGpsNode(Node):
             rtcm_age = float("inf")
             rtcm_active = False
 
+        # GNSS frequency calculation
+        dt = t_now - self.last_status_time
+        if dt > 0:
+            hz = (gs.msg_count - self.last_msg_count) / dt
+        else:
+            hz = 0.0
+        self.last_msg_count = gs.msg_count
+        self.last_status_time = t_now
+
         # NavSatFix
         fix_msg = NavSatFix()
         fix_msg.header.stamp = now
@@ -256,7 +269,7 @@ class HelicalGpsNode(Node):
 
         status_str = (
             f"FIX: {gs.fix_desc} "
-            f"(quality={gs.fix_quality}, sats={gs.num_sats}, HDOP={hdop_str}) | "
+            f"(quality={gs.fix_quality}, sats={gs.num_sats}, HDOP={hdop_str}, rate={hz:.1f}Hz) | "
             f"Lat={lat_str}, Lon={lon_str} | "
             f"RTCM: {'ACTIVE' if rtcm_active else 'STALE'} "
             f"(bytes={rs.total_bytes}, age={rtcm_age:.1f}s)"
@@ -342,6 +355,7 @@ def nmea_reader(
             gnss_status.last_gps_time = now
 
             if isinstance(msg, pynmea2.types.talker.GGA):
+                gnss_status.msg_count += 1
                 gnss_status.lat = msg.latitude if msg.latitude != "" else None
                 gnss_status.lon = msg.longitude if msg.longitude != "" else None
                 try:
