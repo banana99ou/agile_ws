@@ -35,6 +35,7 @@ TOPICS = [
     "/pixhawk/gpsstatus/gps1/raw",
     "/cmd_vel",
     "/cmd_vel_raw",
+    "/wheel/odom",
     "/imu",
     "/estop"
 ]
