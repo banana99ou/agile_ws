@@ -27,6 +27,7 @@ import sys
 import time
 import signal
 import shutil
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -299,12 +300,35 @@ class ScenarioOrchestrator(Node):
         self._pub_status = self.create_publisher(String, "/scenario_runner/status", 10)
         self._pub_event = self.create_publisher(String, "/scenario_runner/event", 10)
 
+        # Helical RTK status gating (String published by GPS-RTK_ROS2_pub_node.py)
+        self._helical_rtk_status_text: Optional[str] = None
+        self._helical_rtk_fix_desc: Optional[str] = None
+        self._helical_rtk_quality: Optional[int] = None
+        self._helical_rtk_seen = False
+        self._helical_rtk_seen_walltime = 0.0
+        self.create_subscription(String, "/gps_rtk_f9p_helical/gps/rtk_status", self._on_helical_rtk_status, 10)
+
         self.estop_active = False
         self._estop_seen = False
         self.create_subscription(Bool, "/estop", self._on_estop, 10)
 
         self.soft_stop_active = False
         self.create_subscription(Bool, "/scenario_runner/soft_stop", self._on_soft_stop, 10)
+
+    _HELICAL_RTK_RE = re.compile(r"^FIX:\s*(?P<desc>.*?)\s*\(quality=(?P<q>\d+),")
+
+    def _on_helical_rtk_status(self, msg: String):
+        s = (msg.data or "").strip()
+        self._helical_rtk_status_text = s
+        self._helical_rtk_seen = True
+        self._helical_rtk_seen_walltime = time.time()
+        m = self._HELICAL_RTK_RE.match(s)
+        if m:
+            self._helical_rtk_fix_desc = m.group("desc").strip()
+            try:
+                self._helical_rtk_quality = int(m.group("q"))
+            except Exception:
+                self._helical_rtk_quality = None
 
     def _on_estop(self, msg: Bool):
         self.estop_active = bool(msg.data)
@@ -385,18 +409,30 @@ class ScenarioOrchestrator(Node):
                 text=True,
                 timeout=float(timeout_s),
             )
-        except subprocess.TimeoutExpired:
-            return False, f"timeout after {timeout_s:.1f}s"
+        except subprocess.TimeoutExpired as e:
+            out = (getattr(e, "stdout", None) or "").strip()
+            err = (getattr(e, "stderr", None) or "").strip()
+            tail = ""
+            if err:
+                tail = f" stderr={err[:300]}"
+            elif out:
+                tail = f" stdout={out[:300]}"
+            return False, f"timeout after {timeout_s:.1f}s running: {' '.join(cmd)}{tail}"
         except Exception as e:
-            return False, f"failed to run ros2 topic echo: {e}"
+            return False, f"failed to run: {' '.join(cmd)} err={e}"
 
         out = (p.stdout or "").strip()
         err = (p.stderr or "").strip()
         if p.returncode == 0 and (out or err):
             return True, "ok"
         if p.returncode != 0:
-            return False, f"exit={p.returncode} stderr={err[:300]}"
-        return False, "no output"
+            extra = ""
+            if err:
+                extra = f" stderr={err[:300]}"
+            elif out:
+                extra = f" stdout={out[:300]}"
+            return False, f"exit={p.returncode} running: {' '.join(cmd)}{extra}"
+        return False, f"no output running: {' '.join(cmd)}"
 
     def preflight_or_raise(
         self,
@@ -407,6 +443,8 @@ class ScenarioOrchestrator(Node):
         topic_appear_timeout_s: float = 20.0,
         echo_timeout_s: float = 2.5,
         estop_wait_s: float = 3.0,
+        require_rtk_fixed: bool = True,
+        rtk_timeout_s: float = 60.0,
     ) -> None:
         """
         Preflight checks before experiment run:
@@ -451,6 +489,23 @@ class ScenarioOrchestrator(Node):
                 "Preflight failed: required topic(s) have no publishers: " + ", ".join(sorted(no_pub))
             )
 
+        # 3) RTK gate: do not start experiments unless we have RTK FIXED.
+        # This is stronger than "GPS topics exist" and matches the experiment requirement.
+        if bool(require_rtk_fixed):
+            deadline = time.time() + float(rtk_timeout_s)
+            while rclpy.ok() and time.time() < deadline:
+                # Keep subscriptions/graph fresh.
+                rclpy.spin_once(self, timeout_sec=0.1)
+                q = self._helical_rtk_quality
+                if q == 4:  # NMEA GGA fix quality 4 == RTK FIXED
+                    break
+            else:
+                last = self._helical_rtk_status_text or "(no /gps_rtk_f9p_helical/gps/rtk_status received)"
+                raise RuntimeError(
+                    "Preflight failed: RTK FIX not available (need RTK FIXED before starting). "
+                    f"Waited {float(rtk_timeout_s):.1f}s; last status: {last}"
+                )
+
         # 3) Subscriber checks for command routing (e.g., safety node listening to cmd_vel_raw)
         bad_sub: List[str] = []
         for t, min_n in must_have_subscribers.items():
@@ -466,16 +521,18 @@ class ScenarioOrchestrator(Node):
                 + ", ".join(bad_sub)
             )
 
-        # 4) Message flow checks (best-effort but strict by default)
+        # 5) Message flow checks (best-effort but strict by default)
         no_msg: List[str] = []
         for t in must_receive_message_topics:
             ok, dbg = self._echo_topic_once(t, timeout_s=float(echo_timeout_s))
             if not ok:
                 no_msg.append(f"{t} ({dbg})")
         if no_msg:
+            for item in no_msg:
+                self.get_logger().error(f"Preflight echo check failed: {item}")
             raise RuntimeError(
-                "Preflight failed: topic(s) not producing messages (echo --once failed): "
-                + "; ".join(no_msg)
+                "Preflight failed: topic(s) not producing messages (ros2 topic echo --once failed):\n"
+                + "\n".join(f"- {item}" for item in no_msg)
             )
 
         self.get_logger().info("Preflight: OK (topics present, publishers/subscribers OK, messages flowing).")
@@ -569,7 +626,7 @@ def main(argv: List[str] | None = None) -> int:
         description="Run limo_scenario_motion.py scenarios from INI description files (hardcoded)."
     )
     p.add_argument(
-        "--scenario-type",
+        "-s", "--scenario-type",
         choices=["static", "const_vel", "const_acc", "angular_rate", "all"],
         default="all",
         help="Which scenario file(s) to search in.",
@@ -580,7 +637,7 @@ def main(argv: List[str] | None = None) -> int:
         help="Print the commands that would run, but do not execute them.",
     )
     p.add_argument(
-        "--level",
+        "-l", "--level",
         type=str,
         default=None,
         help="The level section name to run (e.g. 'level_2'). Required unless using --list-levels.",
@@ -629,6 +686,20 @@ def main(argv: List[str] | None = None) -> int:
         type=float,
         default=3.0,
         help="Seconds to wait to observe at least one /estop message before starting (still fails if E-stop is active).",
+    )
+    # Backwards/typo compatibility: accept both spellings, store to a single attribute.
+    p.add_argument(
+        "--no-rtk-gate",
+        "--no-rtk-gating",
+        dest="no_rtk_gate",
+        action="store_true",
+        help="Disable RTK FIXED gating during preflight (not recommended for GNSS fix experiments).",
+    )
+    p.add_argument(
+        "--preflight-rtk-timeout-s",
+        type=float,
+        default=60.0,
+        help="Seconds to wait for RTK FIXED (via /gps_rtk_f9p_helical/gps/rtk_status) before starting.",
     )
     p.add_argument(
         "--preflight-extra-topic",
@@ -728,8 +799,10 @@ def main(argv: List[str] | None = None) -> int:
 
             must_exist = sorted({t for t in (dl_topics + extras) if t and t not in skip})
 
+            # Topics that should exist / have pubs pre-run but may be silent unless an event occurs.
+            # `/estop` is often only published on state change, so "echo --once" can legitimately time out.
             must_have_pub = [t for t in must_exist if t not in {"/cmd_vel_raw", "/cmd_vel"}]
-            must_recv_msg = [t for t in must_exist if t not in {"/cmd_vel_raw", "/cmd_vel"}]
+            must_recv_msg = [t for t in must_exist if t not in {"/cmd_vel_raw", "/cmd_vel", "/estop"}]
 
             must_have_subs = {
                 "/cmd_vel_raw": 1,  # safety node should be listening
@@ -748,6 +821,8 @@ def main(argv: List[str] | None = None) -> int:
                 topic_appear_timeout_s=float(args.preflight_topic_timeout_s),
                 echo_timeout_s=float(args.preflight_echo_timeout_s),
                 estop_wait_s=float(args.preflight_estop_wait_s),
+                require_rtk_fixed=not bool(args.no_rtk_gate),
+                rtk_timeout_s=float(args.preflight_rtk_timeout_s),
             )
 
         # 3. Execute the single level
