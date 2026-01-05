@@ -472,14 +472,17 @@ class OdomWatcher(Node):
     ):
         """
         Follow S-curve path:
-        x(t) = 20 * sin(0.2 * t)
-        y(t) = 10 * sin(0.4 * t)
+        Default (uniformly scaled to fit 50m x 12m site w/ margin):
+        x(t) = 11 * sin(0.2 * t)
+        y(t) = 5.5 * sin(0.4 * t)
+
+        (This is the original curve uniformly scaled by s=0.55 to preserve shape.)
         
         Commands:
-        vx(t) = 4 * cos(0.2 * t)
-        vy(t) = 4 * cos(0.4 * t)
-        ax(t) = -0.8 * sin(0.2 * t)
-        ay(t) = -1.6 * sin(0.4 * t)
+        vx(t) = d/dt x(t) = Ax*Wx*cos(Wx*t)
+        vy(t) = d/dt y(t) = Ay*Wy*cos(Wy*t)
+        ax(t) = d^2/dt^2 x(t) = -Ax*Wx^2*sin(Wx*t)
+        ay(t) = d^2/dt^2 y(t) = -Ay*Wy^2*sin(Wy*t)
         
         v(t) = sqrt(vx^2 + vy^2)
         w(t) = (vx*ay - vy*ax) / (vx^2 + vy^2)
@@ -507,10 +510,17 @@ class OdomWatcher(Node):
                 break
 
             t = elapsed
-            vx = 4.0 * math.cos(0.2 * t)
-            vy = 4.0 * math.cos(0.4 * t)
-            ax = -0.8 * math.sin(0.2 * t)
-            ay = -1.6 * math.sin(0.4 * t)
+            # Uniformly scaled original curve parameters (shape-preserving).
+            # Original: Ax=20, Wx=0.2, Ay=10, Wy=0.4. Scale s=0.55 -> Ax=11, Ay=5.5.
+            Ax = 11.0
+            Wx = 0.2
+            Ay = 5.5
+            Wy = 0.4
+
+            vx = Ax * Wx * math.cos(Wx * t)
+            vy = Ay * Wy * math.cos(Wy * t)
+            ax = -Ax * (Wx * Wx) * math.sin(Wx * t)
+            ay = -Ay * (Wy * Wy) * math.sin(Wy * t)
             
             v_sq = vx*vx + vy*vy
             v = math.sqrt(v_sq)
