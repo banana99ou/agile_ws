@@ -22,6 +22,7 @@ from datetime import datetime
 
 import rclpy  # pyright: ignore[reportMissingImports]
 from rclpy.node import Node  # pyright: ignore[reportMissingImports]
+from rclpy._rclpy_pybind11 import RCLError  # pyright: ignore[reportMissingImports]
 
 from std_msgs.msg import Bool, String  # pyright: ignore[reportMissingImports]
 
@@ -48,6 +49,44 @@ def build_bag_name(scenario: str, duration_label: str) -> str:
     """
     stamp = datetime.now().strftime("%y_%m%d_%H%M")
     return f"{stamp}_{scenario}_{duration_label}.bag"
+
+def _rewrite_bag_metadata_and_files(bag_dir: str, old_base: str, new_base: str) -> None:
+    """
+    After renaming the bag directory, also rename the internal sqlite files and
+    update metadata.yaml so users don't see DURATION_PLACEHOLDER lingering.
+
+    ros2 bag record typically writes:
+      <old_base>_0.db3 (+ optional -wal/-shm) and metadata.yaml referencing it.
+    """
+    # 1) Rename DB3 and sidecar files (if present)
+    try:
+        for fname in os.listdir(bag_dir):
+            if not fname.startswith(old_base):
+                continue
+            # Preserve suffix like "_0.db3", "_0.db3-wal", etc.
+            suffix = fname[len(old_base):]
+            new_name = new_base + suffix
+            src = os.path.join(bag_dir, fname)
+            dst = os.path.join(bag_dir, new_name)
+            if src != dst and os.path.exists(src):
+                os.rename(src, dst)
+    except FileNotFoundError:
+        return
+
+    # 2) Rewrite metadata.yaml references (best-effort string replace)
+    meta_path = os.path.join(bag_dir, "metadata.yaml")
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            txt = f.read()
+        if old_base in txt:
+            txt = txt.replace(old_base, new_base)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                f.write(txt)
+    except FileNotFoundError:
+        return
+    except OSError:
+        # Best-effort; metadata rewrite isn't strictly required to use the bag.
+        return
 
 
 class DataLoggerHealthNode(Node):
@@ -180,7 +219,12 @@ def main(argv=None) -> int:
         except Exception:
             pass
         node.destroy_node()
-        rclpy.shutdown()
+        # rclpy installs its own SIGINT handler; on Ctrl+C/SIGINT it may already
+        # have shut down the context. We want to still run our bag rename step.
+        try:
+            rclpy.shutdown()
+        except RCLError:
+            pass
 
     if end_monotonic is None:
         end_monotonic = time.monotonic()
@@ -197,6 +241,12 @@ def main(argv=None) -> int:
         if os.path.exists(bag_path):
             os.rename(bag_path, final_bag_path)
             print(f"Renamed bag from '{bag_path}' to '{final_bag_path}'")
+            # Also rename internal files + rewrite metadata so the placeholder doesn't linger.
+            _rewrite_bag_metadata_and_files(
+                bag_dir=final_bag_path,
+                old_base=os.path.basename(bag_name),
+                new_base=os.path.basename(final_bag_name),
+            )
         else:
             print(
                 f"Warning: expected output '{bag_path}' does not exist; "
