@@ -469,6 +469,8 @@ class OdomWatcher(Node):
         distance: float,
         max_duration: float = 60.0,
         rate_hz: float = 20.0,
+        pre_turn_s: float = 1.0,
+        pre_turn_omega: float = -0.4,
     ):
         """
         Follow S-curve path:
@@ -494,6 +496,23 @@ class OdomWatcher(Node):
             return
 
         dt = 1.0 / rate_hz
+        # Optional pre-turn so the motion *begins* with a deterministic clockwise turn.
+        # In standard ROS frames, negative angular.z is clockwise (right turn).
+        if pre_turn_s > 0.0 and abs(pre_turn_omega) > 1e-6:
+            logger.info(
+                f"[s_curve] Pre-turn: {pre_turn_s:.2f} s at omega={pre_turn_omega:.3f} rad/s "
+                f"({'clockwise' if pre_turn_omega < 0 else 'counter-clockwise'})"
+            )
+            end_pre = time.time() + pre_turn_s
+            while rclpy.ok() and time.time() < end_pre:
+                rclpy.spin_once(self, timeout_sec=0.0)
+                twist = Twist()
+                twist.angular.z = pre_turn_omega
+                self.pub.publish(twist)
+                time.sleep(dt)
+            self.stop_robot()
+
+        # Start the S-curve timebase after the pre-turn.
         start_wall_time = time.time()
         
         logger.info(f"[s_curve] distance={distance:.2f} m, max_duration={max_duration:.2f} s")
@@ -628,6 +647,20 @@ def parse_args(argv=None):
         help="Control loop rate (Hz).",
     )
 
+    # s_curve params
+    parser.add_argument(
+        "--s-curve-pre-turn-s",
+        type=float,
+        default=1.0,
+        help="For s_curve: duration (s) of initial in-place turn before starting the curve. 0 disables.",
+    )
+    parser.add_argument(
+        "--s-curve-pre-turn-omega",
+        type=float,
+        default=-0.4,
+        help="For s_curve: angular rate (rad/s) during the initial pre-turn. Negative is clockwise in standard ROS frames.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -680,6 +713,8 @@ def main(argv=None):
                 distance=args.distance,
                 max_duration=args.max_duration,
                 rate_hz=args.rate_hz,
+                pre_turn_s=args.s_curve_pre_turn_s,
+                pre_turn_omega=args.s_curve_pre_turn_omega,
             )
         else:
             node.get_logger().error(f"Unknown scenario: {args.scenario}")
