@@ -583,13 +583,7 @@ class ScenarioOrchestrator(Node):
                 except Exception:
                     pass
 
-    def run_level(
-        self,
-        scenario_type: str,
-        call: ScenarioCall,
-        no_record: bool,
-        record_startup_wait_s: float,
-    ) -> int:
+    def run_level(self, scenario_type: str, call: ScenarioCall, no_record: bool, record_startup_wait_s: float,) -> int:
         label = f"{scenario_type}_{call.name}" if scenario_type else call.name
 
         self.event(f"LEVEL_START {label}")
@@ -625,7 +619,7 @@ def main(argv: List[str] | None = None) -> int:
     p = argparse.ArgumentParser( description="Run limo_scenario_motion.py scenarios from INI description files (hardcoded).")
     p.add_argument(
         "-s", "--scenario-type",
-        choices=["static", "const_vel", "const_acc", "angular_rate", "all"],
+        choices=["static", "const_vel", "const_acc", "angular_rate"],
         default="all",
         help="Which scenario file(s) to search in.",
     )
@@ -725,22 +719,25 @@ def main(argv: List[str] | None = None) -> int:
     rclpy.init(args=None)
     node = ScenarioOrchestrator()
 
+    # Load scenario files
     files: List[Path] = []
-    if args.scenario_type in ("static", "all"):
+    if args.scenario_type in ("static"):
         files.append(STATIC_FILE)
-    if args.scenario_type in ("const_vel", "all"):
+    if args.scenario_type in ("const_vel"):
         files.append(CONST_VEL_FILE)
-    if args.scenario_type in ("const_acc", "all"):
+    if args.scenario_type in ("const_acc"):
         files.append(CONST_ACC_FILE)
-    if args.scenario_type in ("angular_rate", "all"):
+    if args.scenario_type in ("angular_rate"):
         files.append(ANGULAR_RATE_FILE)
 
+    # Error out if the motion script is not found
     if not MOTION_SCRIPT.exists():
         node.get_logger().error(f"Error: motion script not found: {MOTION_SCRIPT}")
         node.destroy_node()
         rclpy.shutdown()
         return 2
 
+    # Run the scenario
     try:
         node.event("RUN_START")
 
@@ -792,13 +789,11 @@ def main(argv: List[str] | None = None) -> int:
         if not bool(args.no_preflight):
             # Build preflight requirements from the Data_Logger topic list.
             # We treat command output topics differently:
-            # - `/cmd_vel_raw`: our motion node publishes this during the run; pre-run we require that
-            #   *someone is subscribed* (typically a safety/E-stop filter node).
-            # - `/cmd_vel`: may not be continuously published; we require subscribers (base driver),
-            #   but do not require pre-run publishers/messages.
-            dl_topics = _try_get_data_logger_topics()
-            skip = set(t.strip() for t in (args.preflight_skip_topic or []) if t and t.strip())
-            extras = [t.strip() for t in (args.preflight_extra_topic or []) if t and t.strip()]
+            # `/cmd_vel_raw`, `/cmd_vel`: our motion node publishes this during the run; pre-run we require that
+            # someone is subscribed (typically a safety/E-stop filter node).
+            dl_topics = _try_get_data_logger_topics() # get Data_Logger topic list
+            skip = set(t.strip() for t in (args.preflight_skip_topic or []) if t and t.strip()) # compile skip topic list
+            extras = [t.strip() for t in (args.preflight_extra_topic or []) if t and t.strip()]      # compile extra topic list to check
 
             must_exist = sorted({t for t in (dl_topics + extras) if t and t not in skip})
 
