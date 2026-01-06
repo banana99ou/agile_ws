@@ -622,9 +622,7 @@ class ScenarioOrchestrator(Node):
 
 
 def main(argv: List[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
-        description="Run limo_scenario_motion.py scenarios from INI description files (hardcoded)."
-    )
+    p = argparse.ArgumentParser( description="Run limo_scenario_motion.py scenarios from INI description files (hardcoded).")
     p.add_argument(
         "-s", "--scenario-type",
         choices=["static", "const_vel", "const_acc", "angular_rate", "all"],
@@ -643,7 +641,7 @@ def main(argv: List[str] | None = None) -> int:
         help="The level section name to run (e.g. 'level_2'). Required unless using --list-levels.",
     )
     p.add_argument(
-        "--list-levels",
+        "-ll", "--list-levels",
         action="store_true",
         help="List available level section names and exit (filtered by --scenario-type).",
     )
@@ -659,13 +657,13 @@ def main(argv: List[str] | None = None) -> int:
         help="Precaution-only: wait this many seconds and confirm Data_Logger.py process stays alive before motion starts.",
     )
     p.add_argument(
-        "--max-dist",
+        "-md", "--max-dist",
         type=float,
         default=20,
         help="Hard cap on distance (m) for any scenario. Overrides .ini file distance if smaller.",
     )
     p.add_argument(
-        "--no-preflight",
+        "-np", "--no-preflight",
         action="store_true",
         help="Skip preflight checks (topics/publishers/message flow/E-stop).",
     )
@@ -687,7 +685,6 @@ def main(argv: List[str] | None = None) -> int:
         default=3.0,
         help="Seconds to wait to observe at least one /estop message before starting (still fails if E-stop is active).",
     )
-    # Backwards/typo compatibility: accept both spellings, store to a single attribute.
     p.add_argument(
         "--no-rtk-gate",
         "--no-rtk-gating",
@@ -712,6 +709,12 @@ def main(argv: List[str] | None = None) -> int:
         action="append",
         default=[],
         help="Topic to exclude from preflight requirements. Can be provided multiple times.",
+    )
+    p.add_argument(
+        "-h", "--help",
+        action="help",
+        default="==SUPPRESS==",
+        help="Show this help message and exit."
     )
     args = p.parse_args(argv)
 
