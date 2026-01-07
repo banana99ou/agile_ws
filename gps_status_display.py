@@ -8,6 +8,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
 from sensor_msgs.msg import NavSatFix, NavSatStatus, Imu
+from mavros_msgs.msg import GPSRAW
 
 
 def quat_to_yaw(q):
@@ -33,16 +34,35 @@ def fix_status_to_string(status: int) -> str:
     return f"UNKNOWN({status})"
 
 
+def gpsraw_fix_type_to_flag(fix_type: int) -> str:
+    """
+    Interpret MAVLink/MAVROS GPSRAW fix_type to a compact flag:
+      4 -> D  (Differential)
+      3 -> 3D
+      2 -> 2D
+    Anything else -> N (No fix)
+    """
+    if fix_type == 4:
+        return "D"
+    if fix_type == 3:
+        return "3D"
+    if fix_type == 2:
+        return "2D"
+    return "N"
+
+
 class GPSStatusDisplay(Node):
     def __init__(self):
         super().__init__('gps_status_display')
 
         # Parameters so you can override topics without editing code
         self.declare_parameter('fix_topic', '/pixhawk/global_position/raw/fix')
+        self.declare_parameter('gpsraw_topic', '/pixhawk/gpsstatus/gps1/raw')
         self.declare_parameter('imu_topic', '/pixhawk/imu/data')  # <-- FIXED default
         self.declare_parameter('print_rate_hz', 2.0)
 
         self.fix_topic = self.get_parameter('fix_topic').get_parameter_value().string_value
+        self.gpsraw_topic = self.get_parameter('gpsraw_topic').get_parameter_value().string_value
         self.imu_topic = self.get_parameter('imu_topic').get_parameter_value().string_value
         print_rate_hz = self.get_parameter('print_rate_hz').get_parameter_value().double_value
         print_period = 1.0 / max(print_rate_hz, 0.1)
@@ -50,6 +70,8 @@ class GPSStatusDisplay(Node):
         # Latest messages
         self.last_fix = None
         self.last_fix_time = None
+        self.last_gpsraw = None
+        self.last_gpsraw_time = None
         self.last_heading_rad = None
         self.last_heading_time = None
 
@@ -58,6 +80,13 @@ class GPSStatusDisplay(Node):
             NavSatFix,
             self.fix_topic,
             self.fix_callback,
+            qos_profile_sensor_data,
+        )
+
+        self.sub_gpsraw = self.create_subscription(
+            GPSRAW,
+            self.gpsraw_topic,
+            self.gpsraw_callback,
             qos_profile_sensor_data,
         )
 
@@ -74,6 +103,7 @@ class GPSStatusDisplay(Node):
         self.get_logger().info(
             f"GPSStatusDisplay started.\n"
             f"  Fix topic: {self.fix_topic}\n"
+            f"  GPSRAW topic: {self.gpsraw_topic}\n"
             f"  IMU topic: {self.imu_topic}\n"
             f"  Print rate: {print_rate_hz:.1f} Hz"
         )
@@ -81,6 +111,10 @@ class GPSStatusDisplay(Node):
     def fix_callback(self, msg: NavSatFix):
         self.last_fix = msg
         self.last_fix_time = self.get_clock().now()
+
+    def gpsraw_callback(self, msg: GPSRAW):
+        self.last_gpsraw = msg
+        self.last_gpsraw_time = self.get_clock().now()
 
     def imu_callback(self, msg: Imu):
         # Some IMUs might publish invalid quaternions at startup.
@@ -101,6 +135,7 @@ class GPSStatusDisplay(Node):
 
         print("=== GPS / IMU Status ===")
         print(f"Fix topic: {self.fix_topic}")
+        print(f"GPSRAW topic: {self.gpsraw_topic}")
         print(f"IMU topic: {self.imu_topic}")
 
         now = self.get_clock().now()
@@ -127,6 +162,17 @@ class GPSStatusDisplay(Node):
 
             if fix_str == "NO_FIX" or zero_pos:
                 print("  Note         : Likely no sky view / no fix yet.")
+
+        # --- GPS Fix flag (from GPSRAW.fix_type) ---
+        if self.last_gpsraw is None or self.last_gpsraw_time is None:
+            print("\nGPS Fix Flag (GPSRAW): waiting for GPSRAW message ...")
+        else:
+            age_raw = (now - self.last_gpsraw_time).nanoseconds / 1e9
+            flag = gpsraw_fix_type_to_flag(int(self.last_gpsraw.fix_type))
+            print("\nGPS Fix Flag (GPSRAW):")
+            print(f"  Fix flag     : {flag}   (fix_type={int(self.last_gpsraw.fix_type)})")
+            print(f"  Satellites   : {int(self.last_gpsraw.satellites_visible)}")
+            print(f"  Age [s]      : {age_raw:.2f}")
 
         # --- Heading from IMU ---
         if self.last_heading_rad is None or self.last_heading_time is None:
