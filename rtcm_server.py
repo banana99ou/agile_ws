@@ -115,9 +115,11 @@ def _update_nmea_status(data):
     try:
         text = data.decode("ascii", errors="ignore")
     except Exception:
+        print(f"[DEBUG] Could not decode data for NMEA status update")
         return
 
     if not text:
+        print(f"[DEBUG] No text after decoding for NMEA status update")
         return
 
     nmea_buf += text
@@ -144,6 +146,7 @@ def _update_nmea_status(data):
                 with status_lock:
                     last_sats_in_view = int(fields[3])
                     last_nmea_time = now
+                    print(f"[DEBUG] GSV updated: sats_in_view={last_sats_in_view} @ {now}")
 
         # GGA: fix quality + satellites used
         elif talker in ("$GPGGA", "$GNGGA"):
@@ -155,6 +158,7 @@ def _update_nmea_status(data):
                     last_fix_quality = fix_q if fix_q != "" else None
                     last_sats_used = int(sats_used) if sats_used.isdigit() else None
                     last_nmea_time = now
+                    print(f"[DEBUG] GGA updated: fix_q={last_fix_quality} sats_used={last_sats_used} @ {now}")
 
 
 def _update_status(data):
@@ -164,6 +168,7 @@ def _update_status(data):
     now = time.time()
     with status_lock:
         last_data_time = now
+        print(f"[DEBUG] Updated last_data_time={last_data_time}")
 
         # RTCM detection
         rtcm_buf.extend(data)
@@ -172,6 +177,10 @@ def _update_status(data):
             last_rtcm_time = now
             for mt, _ln in msgs:
                 last_rtcm_types.add(mt)
+            print(f"[DEBUG] RTCM detected: types={last_rtcm_types} @ {last_rtcm_time}")
+        else:
+            if b'\xd3' in data:
+                print(f"[DEBUG] Data chunk contained RTCM preamble but no full message")
 
     # NMEA parsing can safely run outside the status lock
     _update_nmea_status(data)
@@ -179,6 +188,8 @@ def _update_status(data):
 
 def status_printer():
     """Periodically print a human-readable status line."""
+    last_alive = None
+    last_clients = None
     while True:
         time.sleep(1.0)
         now = time.time()
@@ -215,13 +226,27 @@ def status_printer():
             else:
                 fix_desc = f"fix_q={fix_q}"
 
-        print(
+        status_line = (
             f"[STATUS] alive={alive} "
             f"clients={num_clients} "
             f"sats_visible={sats_visible} (in_view={sats_view}, used={sats_used}) "
             f"fix={fix_desc} "
             f"RTCM_ready={rtcm_desc}"
         )
+
+        print(status_line)
+
+        # Debug print on transitions to alive=False
+        if last_alive is not None and alive != last_alive:
+            print(f"[DEBUG] alive transitioned {last_alive} -> {alive} at {now}")
+            if not alive:
+                print(f"[DEBUG] last_data_time={last_data_time}, now={now}, age={now-last_data_time if last_data_time else None}")
+        last_alive = alive
+
+        # Debug print on client connect/disconnect
+        if last_clients is not None and num_clients != last_clients:
+            print(f"[DEBUG] Client count changed from {last_clients} to {num_clients} at {now}")
+        last_clients = num_clients
 
 
 def _broadcast(data: bytes):
@@ -231,20 +256,32 @@ def _broadcast(data: bytes):
         for c in clients:
             try:
                 c.sendall(data)
-            except Exception:
+            except Exception as e:
+                print(f"[DEBUG] Removing dead client {c}: {e}")
                 dead.append(c)
         for d in dead:
             clients.discard(d)
+        print(f"[DEBUG] Broadcasted to {len(clients)} clients; removed {len(dead)} dead clients.")
 
 
 def serial_reader(serial_port: str, baud: int):
-    ser = serial.Serial(serial_port, baud, timeout=1)
+    print(f"[SERVER] Opening serial port {serial_port} @ {baud}")
+    try:
+        ser = serial.Serial(serial_port, baud, timeout=1)
+    except Exception as e:
+        print(f"[DEBUG] Could not open serial port: {e}")
+        raise
     print(f"[SERVER] Reading RTCM/UBX from {serial_port} @ {baud}")
     while True:
-        data = ser.read(4096)
-        # print(f"data: {data}")
-        if not data:
+        try:
+            data = ser.read(4096)
+        except Exception as e:
+            print(f"[DEBUG] Serial read exception: {e}")
             continue
+        if not data:
+            print(f"[DEBUG] Serial read returned no data")
+            continue
+        print(f"[DEBUG] Serial read {len(data)} bytes")
         _broadcast(data)
 
 
@@ -261,10 +298,12 @@ def demo_broadcaster(rate_hz: float, payload_len: int, also_nmea: bool):
         next_t += 1.0 / max(rate_hz, 0.1)
 
         mt = random.choice(demo_types)
+        print(f"[DEBUG] DEMO: Sending RTCM3 type {mt}, payload_len={payload_len}")
         frame = build_rtcm3_frame(mt, payload_len=payload_len)
         _broadcast(frame)
 
         if also_nmea:
+            print(f"[DEBUG] DEMO: Sending fake NMEA sentence")
             nmea = (
                 "$GNGGA,000000.00,3736.75000,N,12659.66000,E,1,12,0.9,100.0,M,18.0,M,,*00\r\n"
                 "$GPGSV,1,1,12,01,40,100,30,02,50,110,35,03,60,120,40,04,30,130,25*00\r\n"
@@ -276,17 +315,24 @@ def handle_client(conn, addr):
     print(f"[SERVER] Client connected: {addr}")
     with lock:
         clients.add(conn)
+        print(f"[DEBUG] Number of clients after connect: {len(clients)}")
     try:
-        # We don't expect any data from clients; just keep connection alive
         while True:
-            if not conn.recv(1024):
+            try:
+                data = conn.recv(1024)
+            except Exception as e:
+                print(f"[DEBUG] Client {addr} recv failed: {e}")
                 break
-    except Exception:
-        pass
+            if not data:
+                print(f"[DEBUG] Client {addr} closed connection")
+                break
+    except Exception as e:
+        print(f"[DEBUG] Exception in client handler: {e}")
     finally:
         print(f"[SERVER] Client disconnected: {addr}")
         with lock:
             clients.discard(conn)
+            print(f"[DEBUG] Number of clients after disconnect: {len(clients)}")
         conn.close()
 
 
@@ -302,15 +348,18 @@ def main():
     parser.add_argument("--demo_no_nmea", action="store_true", help="Disable fake NMEA in demo mode")
     args = parser.parse_args()
 
+    print("[DEBUG] Server starting up with args:", vars(args))
     threading.Thread(target=status_printer, daemon=True).start()
 
     if args.demo:
+        print("[DEBUG] Starting in DEMO mode")
         threading.Thread(
             target=demo_broadcaster,
             args=(args.demo_rate, args.demo_len, not args.demo_no_nmea),
             daemon=True
         ).start()
     else:
+        print("[DEBUG] Starting in SERIAL mode")
         threading.Thread(target=serial_reader, args=(args.serial, args.baud), daemon=True).start()
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -321,6 +370,7 @@ def main():
 
     while True:
         conn, addr = s.accept()
+        print(f"[DEBUG] Accepted new client: {addr}")
         threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
 
