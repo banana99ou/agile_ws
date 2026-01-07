@@ -49,11 +49,16 @@ from std_msgs.msg import String
 SERIAL_PORT = "/dev/f9p_helical"
 SERIAL_BAUD = 57600
 
-TCP_HOST = "10.42.0.175"
+TCP_HOST = "10.42.0.170"
+# TCP_HOST = "10.0.0.42"
 TCP_PORT = 2101
 
 STATUS_PRINT_INTERVAL = 1.0   # seconds
 RTCM_STALE_SECONDS = 5.0      # consider RTCM stale after this
+
+# Debugging (set True temporarily when diagnosing RTCM "stale")
+DEBUG_RTCM = False
+DEBUG_RTCM_PRINT_INTERVAL = 2.0  # seconds (rate limit for debug prints)
 
 # -------------- STATE --------------
 
@@ -72,7 +77,17 @@ class GNSSStatus:
 @dataclass
 class RTCMStatus:
     total_bytes: int = 0
+    # Updated after we successfully forward bytes into the F9P (post-serial write)
     last_rx_time: float = 0.0
+    # Updated immediately after socket recv() returns bytes (pre-serial write)
+    last_net_rx_time: float = 0.0
+    # Debug counters
+    socket_timeouts: int = 0
+    zero_length_reads: int = 0
+    reconnects: int = 0
+    last_chunk_len: int = 0
+    last_write_ms: float = 0.0
+    _last_debug_print_time: float = 0.0
 
 # -------------- HELPERS --------------
 
@@ -215,13 +230,18 @@ class HelicalGpsNode(Node):
         rs = self.rtcm_status
         t_now = time.time()
 
-        # RTCM status
+        # RTCM status (forwarded-to-F9P time vs. network-received time)
         if rs.last_rx_time > 0:
             rtcm_age = t_now - rs.last_rx_time
             rtcm_active = rtcm_age < RTCM_STALE_SECONDS
         else:
             rtcm_age = float("inf")
             rtcm_active = False
+
+        if getattr(rs, "last_net_rx_time", 0.0) > 0:
+            rtcm_net_age = t_now - rs.last_net_rx_time
+        else:
+            rtcm_net_age = float("inf")
 
         # GNSS frequency calculation
         dt = t_now - self.last_status_time
@@ -272,7 +292,7 @@ class HelicalGpsNode(Node):
             f"(quality={gs.fix_quality}, sats={gs.num_sats}, HDOP={hdop_str}, rate={hz:.1f}Hz) | "
             f"Lat={lat_str}, Lon={lon_str} | "
             f"RTCM: {'ACTIVE' if rtcm_active else 'STALE'} "
-            f"(bytes={rs.total_bytes}, age={rtcm_age:.1f}s)"
+            f"(bytes={rs.total_bytes}, fwd_age={rtcm_age:.1f}s, net_age={rtcm_net_age:.1f}s)"
         )
 
         s_msg = String()
@@ -300,20 +320,54 @@ def rtcm_forwarder(ser_mgr: SerialManager, rtcm_status: RTCMStatus, stop_event: 
             with socket.create_connection((TCP_HOST, TCP_PORT), timeout=10) as sock:
                 sock.settimeout(5.0)
                 print("[RTCM] Connected. Receiving RTCM3 and forwarding to F9P...")
+                rtcm_status.reconnects += 1
 
                 while not stop_event.is_set():
                     try:
                         data = sock.recv(4096)
                         if not data:
                             print("[RTCM] Connection closed by remote.")
+                            rtcm_status.zero_length_reads += 1
                             break
+                        rtcm_status.last_net_rx_time = time.time()
+                        rtcm_status.last_chunk_len = len(data)
                         # Feed F9P: this is where RTCM3 actually goes into the Helical
+                        t0 = time.time()
                         ser_mgr.write(data)
+                        rtcm_status.last_write_ms = (time.time() - t0) * 1000.0
 
                         rtcm_status.total_bytes += len(data)
                         rtcm_status.last_rx_time = time.time()
+
+                        if DEBUG_RTCM:
+                            now = time.time()
+                            if (now - rtcm_status._last_debug_print_time) >= DEBUG_RTCM_PRINT_INTERVAL:
+                                rtcm_status._last_debug_print_time = now
+                                net_to_fwd_ms = (rtcm_status.last_rx_time - rtcm_status.last_net_rx_time) * 1000.0
+                                print(
+                                    "[RTCM][DBG] "
+                                    f"chunk={rtcm_status.last_chunk_len}B "
+                                    f"total={rtcm_status.total_bytes}B "
+                                    f"write={rtcm_status.last_write_ms:.1f}ms "
+                                    f"net→fwd={net_to_fwd_ms:.1f}ms "
+                                    f"timeouts={rtcm_status.socket_timeouts} "
+                                    f"zero_reads={rtcm_status.zero_length_reads} "
+                                    f"reconnects={rtcm_status.reconnects}"
+                                )
                     except socket.timeout:
                         # No data in this interval; just loop
+                        rtcm_status.socket_timeouts += 1
+                        if DEBUG_RTCM:
+                            now = time.time()
+                            if (now - rtcm_status._last_debug_print_time) >= DEBUG_RTCM_PRINT_INTERVAL:
+                                rtcm_status._last_debug_print_time = now
+                                age = (now - rtcm_status.last_rx_time) if rtcm_status.last_rx_time > 0 else float("inf")
+                                net_age = (now - rtcm_status.last_net_rx_time) if rtcm_status.last_net_rx_time > 0 else float("inf")
+                                print(
+                                    "[RTCM][DBG] socket timeout "
+                                    f"(fwd_age={age:.1f}s, net_age={net_age:.1f}s, "
+                                    f"timeouts={rtcm_status.socket_timeouts})"
+                                )
                         continue
         except (socket.error, OSError) as e:
             print(f"[RTCM] Connection error: {e}. Retrying in 5s...")
@@ -327,6 +381,7 @@ def nmea_reader(
     while not stop_event.is_set():
         try:
             line_bytes = ser_mgr.readline()
+            # print(f'line_bytes: {line_bytes}')
             if not line_bytes:
                 continue
 
