@@ -3,12 +3,12 @@ import sys
 import math
 import time
 
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import NavSatFix
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+import rclpy # pyright: ignore[reportMissingImports]
+from rclpy.node import Node # pyright: ignore[reportMissingImports]
+from geometry_msgs.msg import Twist # pyright: ignore[reportMissingImports]
+from nav_msgs.msg import Odometry # pyright: ignore[reportMissingImports]
+from sensor_msgs.msg import NavSatFix # pyright: ignore[reportMissingImports]
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy # pyright: ignore[reportMissingImports]
 
 if sys.platform == 'win32':
     import msvcrt

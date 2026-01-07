@@ -34,14 +34,14 @@ import threading
 import socket
 import serial
 import time
-import pynmea2
+import pynmea2 # pyright: ignore[reportMissingImports]
 from dataclasses import dataclass, field
 from typing import Optional
 
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import NavSatFix, NavSatStatus
-from std_msgs.msg import String
+import rclpy # pyright: ignore[reportMissingImports]
+from rclpy.node import Node # pyright: ignore[reportMissingImports]
+from sensor_msgs.msg import NavSatFix, NavSatStatus # pyright: ignore[reportMissingImports]
+from std_msgs.msg import String # pyright: ignore[reportMissingImports]
 
 # -------------- CONFIG --------------
 

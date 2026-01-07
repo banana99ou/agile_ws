@@ -3,12 +3,12 @@ import math
 import os
 import sys
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+import rclpy # pyright: ignore[reportMissingImports]
+from rclpy.node import Node # pyright: ignore[reportMissingImports]
+from rclpy.qos import qos_profile_sensor_data # pyright: ignore[reportMissingImports]
 
-from sensor_msgs.msg import NavSatFix, NavSatStatus, Imu
-from mavros_msgs.msg import GPSRAW
+from sensor_msgs.msg import NavSatFix, NavSatStatus, Imu # pyright: ignore[reportMissingImports]
+from mavros_msgs.msg import GPSRAW # pyright: ignore[reportMissingImports]
 
 
 def quat_to_yaw(q):

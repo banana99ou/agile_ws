@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import math
 
-import rclpy
-from rclpy.node import Node
-from nav_msgs.msg import Odometry
+import rclpy # pyright: ignore[reportMissingImports]
+from rclpy.node import Node # pyright: ignore[reportMissingImports]
+from nav_msgs.msg import Odometry # pyright: ignore[reportMissingImports]
 
 
 def quat_to_yaw_z(q):

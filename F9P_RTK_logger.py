@@ -4,15 +4,15 @@ import math
 import os
 from datetime import datetime
 
-import rclpy
-from rclpy.node import Node
+import rclpy # pyright: ignore[reportMissingImports]
+from rclpy.node import Node # pyright: ignore[reportMissingImports]
 
-from sensor_msgs.msg import NavSatFix
-from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Twist
+from sensor_msgs.msg import NavSatFix # pyright: ignore[reportMissingImports]
+from nav_msgs.msg import Odometry # pyright: ignore[reportMissingImports]
+from geometry_msgs.msg import Twist # pyright: ignore[reportMissingImports]
 
 # MAVROS GPS raw: fix_type includes RTK_FLOAT/FIXED
-from mavros_msgs.msg import GPSRAW
+from mavros_msgs.msg import GPSRAW # pyright: ignore[reportMissingImports]
 
 
 def quat_to_yaw(q):

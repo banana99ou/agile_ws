@@ -42,10 +42,10 @@ import signal
 from pathlib import Path
 from typing import Optional
 
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+import rclpy # pyright: ignore[reportMissingImports]
+from rclpy.node import Node # pyright: ignore[reportMissingImports]
+from geometry_msgs.msg import Twist # pyright: ignore[reportMissingImports]
+from nav_msgs.msg import Odometry # pyright: ignore[reportMissingImports]
 
 
 def quat_to_yaw_z(q) -> float:
