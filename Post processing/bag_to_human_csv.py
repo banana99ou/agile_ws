@@ -2,10 +2,14 @@
 """
 Convert a ROS 2 bag directory into "human readable" CSV outputs.
 
-This script reads the bag directly (rosbag2_py) and writes:
+This script reads the bag directly and writes:
 - per-topic CSVs with decoded fields (easier than raw JSON blobs)
 - a normalized GNSS fix-flag timeline (F/R/D/3D/2D/N) where possible
 - a small validity/summary report (topic counts + missing required topics)
+
+Bag reader backend:
+- If ROS2 Python packages are available, we can read via `rosbag2_py`.
+- Otherwise, we fall back to the pure-Python `rosbags` package (works well on non-ROS machines).
 
 Project context:
 - README.md defines fix flags as F (RTK Fix), R (RTK Float), D, 3D, 2D, N.
@@ -22,6 +26,9 @@ Examples:
   Convert one bag and put outputs somewhere specific:
     python3 bag_to_human_csv.py /path/to/bag_dir --out-root /tmp/human
 
+  Convert one bag including debug-only CSVs (topic counts, timelines, raw cmd, etc.):
+    python3 bag_to_human_csv.py /path/to/bag_dir --debug
+
   Convert all bags under Experiment Data:
     python3 bag_to_human_csv.py /home/agilex/agilex_ws/Experiment\\ Data --recursive
 """
@@ -36,23 +43,84 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
+# ------------------------- rosbag backends -------------------------
+
+HAVE_ROS2_PY = False
 try:
-    import rosbag2_py
-    from rclpy.serialization import deserialize_message
-    from rosidl_runtime_py.utilities import get_message
-    from rosidl_runtime_py import message_to_ordereddict
-except ImportError:
-    print(
-        "Failed to import ROS 2 Python packages.\n"
-        "Run inside a ROS 2 environment, e.g.:\n"
-        "  source /opt/ros/<distro>/setup.bash\n"
-        "  source install/setup.bash (if you have a workspace)\n"
+    import rosbag2_py  # type: ignore
+    from rclpy.serialization import deserialize_message  # type: ignore
+    from rosidl_runtime_py.utilities import get_message  # type: ignore
+    from rosidl_runtime_py import message_to_ordereddict  # type: ignore
+
+    HAVE_ROS2_PY = True
+except Exception:
+    HAVE_ROS2_PY = False
+
+HAVE_ROSBAGS = False
+try:
+    from rosbags.rosbag2 import Reader as RosbagsReader  # type: ignore
+    from rosbags.typesys import Stores, get_types_from_msg, get_typestore  # type: ignore
+
+    HAVE_ROSBAGS = True
+except Exception:
+    HAVE_ROSBAGS = False
+
+
+def _backend_help() -> str:
+    return (
+        "Unable to read ROS2 bags: neither ROS2 Python packages (`rosbag2_py`) nor the pure-Python\n"
+        "`rosbags` package are available.\n\n"
+        "Fix options:\n"
+        "- Run inside a ROS2 environment (robot/ROS machine):\n"
+        "    source /opt/ros/<distro>/setup.bash\n"
+        "    source <your_ws>/install/setup.bash\n"
+        "- Or install rosbags into your Python env (non-ROS machine):\n"
+        "    pip install rosbags\n"
     )
-    raise
+
+
+def message_to_dict(msg: Any) -> Any:
+    """Recursively convert a rosbags message object to dict/primitives."""
+    if hasattr(msg, "__msgtype__"):
+        out: Dict[str, Any] = {}
+        for field in dir(msg):
+            if not field.startswith("_"):
+                out[field] = message_to_dict(getattr(msg, field))
+        return out
+    if isinstance(msg, (list, tuple)):
+        return [message_to_dict(x) for x in msg]
+    if isinstance(msg, (int, float, str, bool, bytes)) or msg is None:
+        return msg
+    if hasattr(msg, "tolist"):  # numpy
+        return msg.tolist()
+    return msg
+
+
+# rosbags typestore (includes a minimal custom type for MAVROS GPSRAW)
+TYPESTORE = None
+if HAVE_ROSBAGS:
+    GPSRAW_MSG = """
+std_msgs/Header header
+uint8 fix_type
+int32 lat
+int32 lon
+int32 alt
+uint16 eph
+uint16 epv
+uint16 vel
+uint16 cog
+uint8 satellites_visible
+uint8 dgps_numch
+uint32 dgps_age
+"""
+    TYPEMAP = get_types_from_msg(GPSRAW_MSG, "mavros_msgs/msg/GPSRAW")
+    TYPESTORE = get_typestore(Stores.ROS2_HUMBLE)
+    TYPESTORE.register(TYPEMAP)
 
 
 # ------------------------- filename + time helpers -------------------------
@@ -124,28 +192,40 @@ def _detect_storage_id(bag_path: str) -> str:
     return storage_id or "sqlite3"
 
 
-def open_bag_reader(bag_path: str) -> Tuple[rosbag2_py.SequentialReader, Dict[str, str]]:
+def open_bag_reader(bag_path: str) -> Tuple[str, Any, Dict[str, str]]:
     if not os.path.isdir(bag_path):
         raise FileNotFoundError(f"Bag path is not a directory: {bag_path}")
 
-    storage_id = _detect_storage_id(bag_path)
-    storage_options = rosbag2_py.StorageOptions(uri=bag_path, storage_id=storage_id)
-    converter_options = rosbag2_py.ConverterOptions("", "")
+    # Prefer ROS2 native reader when available; otherwise use rosbags.
+    if HAVE_ROS2_PY:
+        storage_id = _detect_storage_id(bag_path)
+        storage_options = rosbag2_py.StorageOptions(uri=bag_path, storage_id=storage_id)
+        converter_options = rosbag2_py.ConverterOptions("", "")
 
-    reader = rosbag2_py.SequentialReader()
-    try:
-        reader.open(storage_options, converter_options)
-    except RuntimeError as e:
-        raise RuntimeError(
-            f"Failed to open bag at '{bag_path}' with storage_id '{storage_id}'.\n"
-            f"Original error: {e}\n"
-            f"- Ensure this is a bag directory containing metadata.yaml\n"
-        ) from e
+        reader = rosbag2_py.SequentialReader()
+        try:
+            reader.open(storage_options, converter_options)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Failed to open bag at '{bag_path}' with storage_id '{storage_id}'.\n"
+                f"Original error: {e}\n"
+                f"- Ensure this is a bag directory containing metadata.yaml\n"
+            ) from e
 
-    topic_type_map: Dict[str, str] = {}
-    for t in reader.get_all_topics_and_types():
-        topic_type_map[t.name] = t.type
-    return reader, topic_type_map
+        topic_type_map: Dict[str, str] = {}
+        for t in reader.get_all_topics_and_types():
+            topic_type_map[t.name] = t.type
+        return "rosbag2_py", reader, topic_type_map
+
+    if HAVE_ROSBAGS:
+        if TYPESTORE is None:
+            raise RuntimeError("rosbags typestore was not initialized (unexpected).")
+        r = RosbagsReader(Path(bag_path))
+        r.open()
+        topic_type_map = {c.topic: c.msgtype for c in r.connections}
+        return "rosbags", r, topic_type_map
+
+    raise RuntimeError(_backend_help())
 
 
 # ------------------------- parsing + normalization -------------------------
@@ -457,15 +537,15 @@ def find_bag_dirs(root: str) -> List[str]:
     return sorted(out)
 
 
-def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, sustain_s: float) -> str:
+def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, sustain_s: float, debug: bool) -> str:
     bag_base = os.path.basename(os.path.normpath(bag_path)) or "bag"
     out_root_final = out_root or os.getcwd()
     out_dir = os.path.join(out_root_final, "human_csv", _sanitize_for_filename(bag_base))
     os.makedirs(out_dir, exist_ok=True)
 
-    reader, topic_type_map = open_bag_reader(bag_path)
+    backend, reader, topic_type_map = open_bag_reader(bag_path)
 
-    # type cache
+    # type cache (rosbag2_py only)
     msg_type_cache: Dict[str, type] = {}
 
     # counts
@@ -473,27 +553,10 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
     total_msgs = 0
 
     # writers
-    w_f9p_status = LazyCsv(
-        os.path.join(out_dir, "gnss_f9p_helical_rtk_status.csv"),
-        [
-            "ts_sec",
-            "ts_iso_utc",
-            "bag_ts_ns",
-            "hdr_stamp_sec",
-            "hdr_stamp_nanosec",
-            "fix_flag",
-            "fix_desc",
-            "quality",
-            "sats",
-            "hdop",
-            "lat",
-            "lon",
-            "rtcm_active",
-            "rtcm_bytes",
-            "rtcm_age_s",
-            "raw",
-        ],
-    )
+    #
+    # Some CSVs are debug-only to avoid cluttering default outputs.
+    # Enable with --debug / --verbose.
+    w_f9p_status: Optional[LazyCsv] = None
     w_f9p_fix = LazyCsv(
         os.path.join(out_dir, "gnss_f9p_helical_fix.csv"),
         [
@@ -527,10 +590,7 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
             "fix_flag",
         ],
     )
-    w_px4_sats = LazyCsv(
-        os.path.join(out_dir, "pixhawk_satellites.csv"),
-        ["ts_sec", "ts_iso_utc", "satellites"],
-    )
+    w_px4_sats: Optional[LazyCsv] = None
     w_px4_gpsraw = LazyCsv(
         os.path.join(out_dir, "pixhawk_gpsraw_gps1.csv"),
         [
@@ -555,10 +615,7 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
         os.path.join(out_dir, "motion_cmd_vel.csv"),
         ["ts_sec", "ts_iso_utc", "lin_x", "lin_y", "lin_z", "ang_x", "ang_y", "ang_z"],
     )
-    w_cmd_raw = LazyCsv(
-        os.path.join(out_dir, "motion_cmd_vel_raw.csv"),
-        ["ts_sec", "ts_iso_utc", "lin_x", "lin_y", "lin_z", "ang_x", "ang_y", "ang_z"],
-    )
+    w_cmd_raw: Optional[LazyCsv] = None
     w_imu = LazyCsv(
         os.path.join(out_dir, "imu.csv"),
         [
@@ -575,35 +632,10 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
         ],
     )
     w_estop = LazyCsv(os.path.join(out_dir, "estop.csv"), ["ts_sec", "ts_iso_utc", "estop"])
-    w_timeline = LazyCsv(
-        os.path.join(out_dir, "gnss_timeline.csv"),
-        ["ts_sec", "ts_iso_utc", "receiver", "fix_flag", "lat", "lon", "alt", "detail"],
-    )
-    w_f9p_nmea_time = LazyCsv(
-        os.path.join(out_dir, "gnss_f9p_helical_nmea_time.csv"),
-        [
-            "ts_sec",
-            "ts_iso_utc",
-            "bag_ts_ns",
-            "utc_time_hhmmss",
-            "utc_date_ddmmyy",
-            "gps_iso_utc",
-            "sentence_type",
-        ],
-    )
-    w_metrics = LazyCsv(
-        os.path.join(out_dir, "gnss_metrics.csv"),
-        [
-            "receiver",
-            "desired_flag",
-            "sustain_s",
-            "first_desired_ts",
-            "total_desired_s",
-            "num_segments",
-            "num_refix_events",
-        ],
-    )
-    w_counts = LazyCsv(os.path.join(out_dir, "topic_counts.csv"), ["topic", "type", "messages"])
+    w_timeline: Optional[LazyCsv] = None
+    w_f9p_nmea_time: Optional[LazyCsv] = None
+    w_metrics: Optional[LazyCsv] = None
+    w_counts: Optional[LazyCsv] = None
     w_validity = LazyCsv(
         os.path.join(out_dir, "validity_summary.csv"),
         [
@@ -621,13 +653,77 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
         ],
     )
 
-    trackers = {
-        "f9p_helical": RefixTracker("f9p_helical", desired_flag=desired_flag, sustain_s=sustain_s),
-        "pixhawk": RefixTracker("pixhawk", desired_flag=desired_flag, sustain_s=sustain_s),
-    }
+    trackers: Optional[Dict[str, RefixTracker]] = None
+
+    if debug:
+        w_f9p_status = LazyCsv(
+            os.path.join(out_dir, "gnss_f9p_helical_rtk_status.csv"),
+            [
+                "ts_sec",
+                "ts_iso_utc",
+                "bag_ts_ns",
+                "hdr_stamp_sec",
+                "hdr_stamp_nanosec",
+                "fix_flag",
+                "fix_desc",
+                "quality",
+                "sats",
+                "hdop",
+                "lat",
+                "lon",
+                "rtcm_active",
+                "rtcm_bytes",
+                "rtcm_age_s",
+                "raw",
+            ],
+        )
+        w_px4_sats = LazyCsv(
+            os.path.join(out_dir, "pixhawk_satellites.csv"),
+            ["ts_sec", "ts_iso_utc", "satellites"],
+        )
+        w_cmd_raw = LazyCsv(
+            os.path.join(out_dir, "motion_cmd_vel_raw.csv"),
+            ["ts_sec", "ts_iso_utc", "lin_x", "lin_y", "lin_z", "ang_x", "ang_y", "ang_z"],
+        )
+        w_timeline = LazyCsv(
+            os.path.join(out_dir, "gnss_timeline.csv"),
+            ["ts_sec", "ts_iso_utc", "receiver", "fix_flag", "lat", "lon", "alt", "detail"],
+        )
+        w_f9p_nmea_time = LazyCsv(
+            os.path.join(out_dir, "gnss_f9p_helical_nmea_time.csv"),
+            [
+                "ts_sec",
+                "ts_iso_utc",
+                "bag_ts_ns",
+                "utc_time_hhmmss",
+                "utc_date_ddmmyy",
+                "gps_iso_utc",
+                "sentence_type",
+            ],
+        )
+        w_metrics = LazyCsv(
+            os.path.join(out_dir, "gnss_metrics.csv"),
+            [
+                "receiver",
+                "desired_flag",
+                "sustain_s",
+                "first_desired_ts",
+                "total_desired_s",
+                "num_segments",
+                "num_refix_events",
+            ],
+        )
+        w_counts = LazyCsv(os.path.join(out_dir, "topic_counts.csv"), ["topic", "type", "messages"])
+        trackers = {
+            "f9p_helical": RefixTracker("f9p_helical", desired_flag=desired_flag, sustain_s=sustain_s),
+            "pixhawk": RefixTracker("pixhawk", desired_flag=desired_flag, sustain_s=sustain_s),
+        }
 
     # If GPSRAW exists, prefer it for pixhawk flag timeline.
+    # NOTE: Some environments cannot deserialize this message type; detect and fall back.
     have_px4_gpsraw = PREFERRED_PIXHAWK_FIX_TOPIC in topic_type_map
+    px4_gpsraw_broken = False
+    px4_gpsraw_first_error: Optional[str] = None
 
     # Track last-known F9P fix flag from rtk_status so NavSatFix rows don't mislabel RTK as "D".
     last_f9p_fix_flag: Optional[str] = None
@@ -644,31 +740,65 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
     pixhawk_gpsraw_sat_max: Optional[int] = None
     pixhawk_gpsraw_sat_samples = 0
 
-    while reader.has_next():
-        topic, data, t_ns = reader.read_next()
+    def iter_decoded_messages() -> Iterable[Tuple[str, int, Optional[Dict[str, Any]]]]:
+        """
+        Yield (topic, t_ns, msg_dict|None) for every message in the bag.
+        msg_dict is None when deserialization fails; counters should still advance.
+        """
+        nonlocal px4_gpsraw_broken, px4_gpsraw_first_error
+
+        if backend == "rosbag2_py":
+            while reader.has_next():
+                topic, data, t_ns = reader.read_next()
+
+                type_str = topic_type_map.get(topic)
+                if not type_str:
+                    yield topic, int(t_ns), None
+                    continue
+                if type_str not in msg_type_cache:
+                    msg_type_cache[type_str] = get_message(type_str)
+                msg_type = msg_type_cache[type_str]
+
+                try:
+                    msg_obj = deserialize_message(data, msg_type)
+                    msg = message_to_ordereddict(msg_obj)
+                    yield topic, int(t_ns), msg
+                except Exception as e:
+                    if topic == PREFERRED_PIXHAWK_FIX_TOPIC:
+                        px4_gpsraw_broken = True
+                        if px4_gpsraw_first_error is None:
+                            px4_gpsraw_first_error = f"{type(e).__name__}: {e}"
+                    yield topic, int(t_ns), None
+            return
+
+        if backend == "rosbags":
+            for connection, t_ns, data in reader.messages():
+                topic = connection.topic
+                try:
+                    assert TYPESTORE is not None
+                    msg_obj = TYPESTORE.deserialize_cdr(data, connection.msgtype)
+                    msg = message_to_dict(msg_obj)
+                    yield topic, int(t_ns), msg
+                except Exception as e:
+                    if topic == PREFERRED_PIXHAWK_FIX_TOPIC:
+                        px4_gpsraw_broken = True
+                        if px4_gpsraw_first_error is None:
+                            px4_gpsraw_first_error = f"{type(e).__name__}: {e}"
+                    yield topic, int(t_ns), None
+            return
+
+        raise RuntimeError(f"Unknown bag backend: {backend}")
+
+    for topic, t_ns, msg in iter_decoded_messages():
         total_msgs += 1
         if topic in msg_counts:
             msg_counts[topic] += 1
-
-        type_str = topic_type_map.get(topic)
-        if not type_str:
-            continue
-        if type_str not in msg_type_cache:
-            msg_type_cache[type_str] = get_message(type_str)
-        msg_type = msg_type_cache[type_str]
-
-        # Deserialize only for topics we care about (but we already have msg_type; cheap enough).
-        try:
-            msg_obj = deserialize_message(data, msg_type)
-        except Exception:
+        if msg is None:
             continue
 
         ts_sec = t_ns / 1e9
         ts_iso = _ts_to_iso_utc(ts_sec)
         bag_ts_ns = int(t_ns)
-
-        # Convert to dict so field access is robust across message classes.
-        msg = message_to_ordereddict(msg_obj)
 
         # Header stamp if present
         hdr = msg.get("header") if isinstance(msg, dict) else None
@@ -683,30 +813,33 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
             if parsed:
                 last_f9p_fix_flag = parsed["fix_flag"]
                 last_f9p_fix_flag_ts = ts_sec
-                w_f9p_status.write(
-                    {
-                        "ts_sec": f"{ts_sec:.9f}",
-                        "ts_iso_utc": ts_iso,
-                        "bag_ts_ns": bag_ts_ns,
-                        "hdr_stamp_sec": "" if hdr_stamp_sec is None else hdr_stamp_sec,
-                        "hdr_stamp_nanosec": "" if hdr_stamp_nanosec is None else hdr_stamp_nanosec,
-                        **parsed,
-                        "raw": s,
-                    }
-                )
-                w_timeline.write(
-                    {
-                        "ts_sec": f"{ts_sec:.9f}",
-                        "ts_iso_utc": ts_iso,
-                        "receiver": "f9p_helical",
-                        "fix_flag": parsed["fix_flag"],
-                        "lat": parsed.get("lat", ""),
-                        "lon": parsed.get("lon", ""),
-                        "alt": "",
-                        "detail": f"{parsed.get('fix_desc','')}; q={parsed.get('quality','')}; sats={parsed.get('sats','')}; hdop={parsed.get('hdop','')}; rtcm_active={parsed.get('rtcm_active','')}",
-                    }
-                )
-                trackers["f9p_helical"].update(ts_sec, parsed["fix_flag"])
+                if w_f9p_status is not None:
+                    w_f9p_status.write(
+                        {
+                            "ts_sec": f"{ts_sec:.9f}",
+                            "ts_iso_utc": ts_iso,
+                            "bag_ts_ns": bag_ts_ns,
+                            "hdr_stamp_sec": "" if hdr_stamp_sec is None else hdr_stamp_sec,
+                            "hdr_stamp_nanosec": "" if hdr_stamp_nanosec is None else hdr_stamp_nanosec,
+                            **parsed,
+                            "raw": s,
+                        }
+                    )
+                if w_timeline is not None:
+                    w_timeline.write(
+                        {
+                            "ts_sec": f"{ts_sec:.9f}",
+                            "ts_iso_utc": ts_iso,
+                            "receiver": "f9p_helical",
+                            "fix_flag": parsed["fix_flag"],
+                            "lat": parsed.get("lat", ""),
+                            "lon": parsed.get("lon", ""),
+                            "alt": "",
+                            "detail": f"{parsed.get('fix_desc','')}; q={parsed.get('quality','')}; sats={parsed.get('sats','')}; hdop={parsed.get('hdop','')}; rtcm_active={parsed.get('rtcm_active','')}",
+                        }
+                    )
+                if trackers is not None:
+                    trackers["f9p_helical"].update(ts_sec, parsed["fix_flag"])
             continue
 
         # --- F9P Helical NavSatFix (coarse) ---
@@ -748,7 +881,7 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
             if date_ddmmyy:
                 last_nmea_date_ddmmyy = date_ddmmyy
             utc_hhmmss = _parse_nmea_utc_hhmmss(raw)
-            if utc_hhmmss:
+            if utc_hhmmss and w_f9p_nmea_time is not None:
                 gps_iso = _nmea_date_time_to_iso_utc(last_nmea_date_ddmmyy or "", utc_hhmmss)
                 sent_type = raw.split(",")[0] if raw else ""
                 w_f9p_nmea_time.write(
@@ -801,23 +934,25 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
                 }
             )
 
-            w_timeline.write(
-                {
-                    "ts_sec": f"{ts_sec:.9f}",
-                    "ts_iso_utc": ts_iso,
-                    "receiver": "pixhawk",
-                    "fix_flag": fix_flag,
-                    "lat": "" if lat is None else lat,
-                    "lon": "" if lon is None else lon,
-                    "alt": "" if alt_m is None else alt_m,
-                    "detail": f"GPSRAW.fix_type={fix_type}",
-                }
-            )
-            trackers["pixhawk"].update(ts_sec, fix_flag)
+            if w_timeline is not None:
+                w_timeline.write(
+                    {
+                        "ts_sec": f"{ts_sec:.9f}",
+                        "ts_iso_utc": ts_iso,
+                        "receiver": "pixhawk",
+                        "fix_flag": fix_flag,
+                        "lat": "" if lat is None else lat,
+                        "lon": "" if lon is None else lon,
+                        "alt": "" if alt_m is None else alt_m,
+                        "detail": f"GPSRAW.fix_type={fix_type}",
+                    }
+                )
+            if trackers is not None:
+                trackers["pixhawk"].update(ts_sec, fix_flag)
             continue
 
         # --- Pixhawk NavSatFix (fallback only, if GPSRAW missing) ---
-        if (topic == "/pixhawk/global_position/raw/fix") and (not have_px4_gpsraw):
+        if (topic == "/pixhawk/global_position/raw/fix") and ((not have_px4_gpsraw) or px4_gpsraw_broken):
             lat = _safe_float(msg.get("latitude"))
             lon = _safe_float(msg.get("longitude"))
             alt = _safe_float(msg.get("altitude"))
@@ -839,19 +974,21 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
                     "fix_flag": fix_flag,
                 }
             )
-            w_timeline.write(
-                {
-                    "ts_sec": f"{ts_sec:.9f}",
-                    "ts_iso_utc": ts_iso,
-                    "receiver": "pixhawk",
-                    "fix_flag": fix_flag,
-                    "lat": "" if lat is None else lat,
-                    "lon": "" if lon is None else lon,
-                    "alt": "" if alt is None else alt,
-                    "detail": f"NavSatFix.status={navsat_status}",
-                }
-            )
-            trackers["pixhawk"].update(ts_sec, fix_flag)
+            if w_timeline is not None:
+                w_timeline.write(
+                    {
+                        "ts_sec": f"{ts_sec:.9f}",
+                        "ts_iso_utc": ts_iso,
+                        "receiver": "pixhawk",
+                        "fix_flag": fix_flag,
+                        "lat": "" if lat is None else lat,
+                        "lon": "" if lon is None else lon,
+                        "alt": "" if alt is None else alt,
+                        "detail": f"NavSatFix.status={navsat_status}",
+                    }
+                )
+            if trackers is not None:
+                trackers["pixhawk"].update(ts_sec, fix_flag)
             continue
 
         # --- Pixhawk satellites ---
@@ -861,13 +998,14 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
                 pixhawk_sat_samples += 1
                 pixhawk_sat_min = sats if pixhawk_sat_min is None else min(pixhawk_sat_min, sats)
                 pixhawk_sat_max = sats if pixhawk_sat_max is None else max(pixhawk_sat_max, sats)
-            w_px4_sats.write(
-                {
-                    "ts_sec": f"{ts_sec:.9f}",
-                    "ts_iso_utc": ts_iso,
-                    "satellites": "" if sats is None else sats,
-                }
-            )
+            if w_px4_sats is not None:
+                w_px4_sats.write(
+                    {
+                        "ts_sec": f"{ts_sec:.9f}",
+                        "ts_iso_utc": ts_iso,
+                        "satellites": "" if sats is None else sats,
+                    }
+                )
             continue
 
         # --- cmd_vel + cmd_vel_raw ---
@@ -885,7 +1023,8 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
                 "ang_z": _safe_float(ang.get("z")) or 0.0,
             }
             if topic == "/cmd_vel_raw":
-                w_cmd_raw.write(out_row)
+                if w_cmd_raw is not None:
+                    w_cmd_raw.write(out_row)
             else:
                 w_cmd.write(out_row)
             continue
@@ -928,9 +1067,10 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
             w_estop.write({"ts_sec": f"{ts_sec:.9f}", "ts_iso_utc": ts_iso, "estop": 1 if estop else 0})
             continue
 
-    # Write topic counts
-    for topic_name, type_str in sorted(topic_type_map.items()):
-        w_counts.write({"topic": topic_name, "type": type_str, "messages": msg_counts.get(topic_name, 0)})
+    # Write topic counts (debug-only)
+    if w_counts is not None:
+        for topic_name, type_str in sorted(topic_type_map.items()):
+            w_counts.write({"topic": topic_name, "type": type_str, "messages": msg_counts.get(topic_name, 0)})
 
     # Validity summary
     required = list(REQUIRED_TOPICS)
@@ -940,9 +1080,12 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
     missing = [t for t in required if t not in topic_type_map]
     notes = ""
     if not have_px4_gpsraw:
-        notes += "pixhawk_fix_source=NavSatFix(fallback); "
+        notes += "pixhawk_fix_source=NavSatFix(fallback_missing_gpsraw); "
     else:
-        notes += "pixhawk_fix_source=GPSRAW(preferred); "
+        if px4_gpsraw_broken:
+            notes += f"pixhawk_fix_source=NavSatFix(fallback_due_to_gpsraw_decode_error={px4_gpsraw_first_error}); "
+        else:
+            notes += "pixhawk_fix_source=GPSRAW(preferred); "
 
     w_validity.write(
         {
@@ -960,39 +1103,45 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
         }
     )
 
-    # Metrics
-    for tr in trackers.values():
-        tr.finalize()
-        w_metrics.write(
-            {
-                "receiver": tr.receiver,
-                "desired_flag": tr.desired_flag,
-                "sustain_s": tr.sustain_s,
-                "first_desired_ts": "" if tr.first_desired_ts is None else f"{tr.first_desired_ts:.9f}",
-                "total_desired_s": f"{tr.total_desired_s:.3f}",
-                "num_segments": tr.num_segments,
-                "num_refix_events": tr.num_refix_events,
-            }
-        )
+    # Metrics (debug-only)
+    if w_metrics is not None and trackers is not None:
+        for tr in trackers.values():
+            tr.finalize()
+            w_metrics.write(
+                {
+                    "receiver": tr.receiver,
+                    "desired_flag": tr.desired_flag,
+                    "sustain_s": tr.sustain_s,
+                    "first_desired_ts": "" if tr.first_desired_ts is None else f"{tr.first_desired_ts:.9f}",
+                    "total_desired_s": f"{tr.total_desired_s:.3f}",
+                    "num_segments": tr.num_segments,
+                    "num_refix_events": tr.num_refix_events,
+                }
+            )
 
     # Close writers
     for w in (
-        w_f9p_status,
         w_f9p_fix,
         w_px4_fix,
-        w_px4_sats,
         w_px4_gpsraw,
         w_cmd,
-        w_cmd_raw,
         w_imu,
         w_estop,
-        w_timeline,
-        w_f9p_nmea_time,
-        w_metrics,
-        w_counts,
         w_validity,
     ):
-        w.close()
+        if w is not None:
+            w.close()
+
+    for w in (w_f9p_status, w_px4_sats, w_cmd_raw, w_timeline, w_f9p_nmea_time, w_metrics, w_counts):
+        if w is not None:
+            w.close()
+
+    # Close backend reader if needed
+    try:
+        if hasattr(reader, "close"):
+            reader.close()
+    except Exception:
+        pass
 
     return out_dir
 
@@ -1001,18 +1150,27 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Convert ros2 bag directories into human-readable CSV outputs.")
     p.add_argument("path", help="Bag directory (contains metadata.yaml) OR a directory containing many bags.")
     p.add_argument("--recursive", action="store_true", help="If PATH is a directory, scan recursively for bag dirs.")
+    p.add_argument(
+        "--bag-prefix",
+        default=None,
+        help="If set, only process bag directories whose folder name starts with this prefix (e.g. '26_0105_').",
+    )
     p.add_argument("--out-root", default=None, help="Output root directory (default: current working directory).")
     p.add_argument("--desired-flag", default="F", help="Desired fix flag for metrics (default: F).")
     p.add_argument("--sustain-s", type=float, default=1.0, help="Sustain time for 'refixed' metric (default: 1.0s).")
+    p.add_argument("--debug", action="store_true", help="Write debug-only CSVs (timeline, counts, raw cmd, etc.).")
+    p.add_argument("--verbose", action="store_true", help="Alias for --debug.")
     return p.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     path = args.path
+    debug = bool(getattr(args, "debug", False) or getattr(args, "verbose", False))
+    bag_prefix = (getattr(args, "bag_prefix", None) or "").strip() or None
 
     if _bag_is_dir(path):
-        out_dir = convert_bag(path, args.out_root, args.desired_flag, args.sustain_s)
+        out_dir = convert_bag(path, args.out_root, args.desired_flag, args.sustain_s, debug=debug)
         print(f"[OK] Wrote human CSVs to: {out_dir}")
         return 0
 
@@ -1030,13 +1188,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         bag_dirs = find_bag_dirs(path)
 
+    if bag_prefix:
+        bag_dirs = [d for d in bag_dirs if os.path.basename(os.path.normpath(d)).startswith(bag_prefix)]
+
     if not bag_dirs:
         print(f"No bag directories found under: {path}", file=sys.stderr)
         return 3
 
     for bag_dir in bag_dirs:
         try:
-            out_dir = convert_bag(bag_dir, args.out_root, args.desired_flag, args.sustain_s)
+            out_dir = convert_bag(bag_dir, args.out_root, args.desired_flag, args.sustain_s, debug=debug)
             print(f"[OK] {bag_dir} -> {out_dir}")
         except Exception as e:
             print(f"[FAIL] {bag_dir}: {e}", file=sys.stderr)
