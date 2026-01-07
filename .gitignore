@@ -44,9 +44,12 @@ src/*
 ########################
 ohcoach-cell-tools/FTG/
 
-
+########################
+# Experiment and runtime outputs
+########################
+plots_all_2026-01-03
+exports_all_*
+human_csv
+_tmp**
 estop_debug_*.csv
 rtcm_log_*.csv
-plots_all_2026-01-03
-exports_all_2026-01-03
-human_csv
