@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+
+"""
+check_rtcm.py
+
+Testing code to observe and analyze RTCM3 (Radio Technical Commission for Maritime Services) messages from a u-blox F9P helical antenna receiver operating as a base station.
+
+Key Points:
+- Intended for evaluating how the u-blox F9P (with a helical antenna) performs as a basestation by checking the RTCM3 message stream output over serial.
+- Connects to a specified serial port and reads continuous data.
+- Scans for and parses valid RTCM3 messages (which start with preamble 0xD3).
+- Extracts message type and payload length for each complete RTCM3 message detected.
+- Optionally prints detailed debug information if --debug is passed.
+
+Dependencies:
+- pyserial
+
+Example usage:
+    python3 check_rtcm.py --debug
+"""
+
+
 import serial
 from datetime import datetime
 import argparse
