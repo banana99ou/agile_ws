@@ -374,9 +374,7 @@ def rtcm_forwarder(ser_mgr: SerialManager, rtcm_status: RTCMStatus, stop_event: 
             time.sleep(5)
 
 
-def nmea_reader(
-    ser_mgr: SerialManager, gnss_status: GNSSStatus, node: HelicalGpsNode, stop_event: threading.Event
-):
+def nmea_reader(ser_mgr: SerialManager, gnss_status: GNSSStatus, node: HelicalGpsNode, stop_event: threading.Event):
     """Read NMEA from F9P, update GNSS status, and publish raw NMEA."""
     while not stop_event.is_set():
         try:
