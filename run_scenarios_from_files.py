@@ -640,6 +640,11 @@ def main(argv: List[str] | None = None) -> int:
         help="List available level section names and exit (filtered by --scenario-type).",
     )
     p.add_argument(
+        "-sn", "--show-notes",
+        action="store_true",
+        help="Show notes for scenario levels (use with --list-levels or --level).",
+    )
+    p.add_argument(
         "--no-record",
         action="store_true",
         help="Do not start/stop Data_Logger.py (motion only).",
@@ -704,12 +709,6 @@ def main(argv: List[str] | None = None) -> int:
         default=[],
         help="Topic to exclude from preflight requirements. Can be provided multiple times.",
     )
-    p.add_argument(
-        "-h", "--help",
-        action="help",
-        default="==SUPPRESS==",
-        help="Show this help message and exit."
-    )
     args = p.parse_args(argv)
 
     if not args.list_levels and not args.level:
@@ -748,14 +747,31 @@ def main(argv: List[str] | None = None) -> int:
                     meta, calls, _ = load_scenario_file(path, max_dist=args.max_dist)
                     scenario_type = meta.get("type", "").strip()
                     print(f"{path.name} (type={scenario_type})")
+                    # Show header for notes if requested
+                    if args.show_notes:
+                        print("    Notes:")
                     for c in calls:
-                        print(f"  - {c.name}")
+                        line = f"  - {c.name}"
+                        if args.show_notes:
+                            # Print the notes field if present and nonempty
+                            try:
+                                cfg = configparser.ConfigParser(interpolation=None)
+                                cfg.optionxform = str
+                                cfg.read(path, encoding="utf-8")
+                                if c.name in cfg:
+                                    notes = cfg[c.name].get("notes", "").strip()
+                                    if notes:
+                                        line += f"  [notes: {notes}]"
+                            except Exception as e:
+                                line += f"  [error reading notes: {e}]"
+                        print(line)
                 except Exception as e:
                     print(f"Error reading {path.name}: {e}")
             return 0
 
         # 2. Find the specific requested level (across all allowed files).
         target_call: Optional[Tuple[Path, str, ScenarioCall]] = None
+        selected_level_notes = None
         for path in files:
             try:
                 meta, calls, _ = load_scenario_file(path, max_dist=args.max_dist)
@@ -763,6 +779,18 @@ def main(argv: List[str] | None = None) -> int:
                 for c in calls:
                     if c.name == args.level:
                         target_call = (path, scenario_type, c)
+                        # If --show-notes, find notes for this level
+                        if args.show_notes:
+                            try:
+                                cfg = configparser.ConfigParser(interpolation=None)
+                                cfg.optionxform = str
+                                cfg.read(path, encoding="utf-8")
+                                if c.name in cfg:
+                                    notes = cfg[c.name].get("notes", "").strip()
+                                    if notes:
+                                        selected_level_notes = notes
+                            except Exception as e:
+                                selected_level_notes = f"(Error reading notes: {e})"
                         break
                 if target_call:
                     break
@@ -781,6 +809,10 @@ def main(argv: List[str] | None = None) -> int:
         node.get_logger().info(f"Level: {call.name}")
         node.get_logger().info("Command: " + " ".join(call.argv))
         node.status(f"phase=ready file={path.name} level={call.name}")
+
+        # If --show-notes and notes exist, print them for this level
+        if args.show_notes and selected_level_notes:
+            print(f"Notes for {call.name}: {selected_level_notes}")
 
         if args.dry_run:
             node.get_logger().info("Dry run: not executing.")
