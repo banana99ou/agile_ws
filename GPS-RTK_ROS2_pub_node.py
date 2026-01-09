@@ -60,6 +60,9 @@ RTCM_STALE_SECONDS = 5.0      # consider RTCM stale after this
 DEBUG_RTCM = False
 DEBUG_RTCM_PRINT_INTERVAL = 2.0  # seconds (rate limit for debug prints)
 
+# New: NMEA life sign print config
+NMEA_LIFE_SIGN_INTERVAL = 5.0  # seconds between NMEA log prints
+
 # -------------- STATE --------------
 
 @dataclass
@@ -191,6 +194,10 @@ class HelicalGpsNode(Node):
         self.nmea_pub = self.create_publisher(String, "gps/nmea", 10)
         self.status_pub = self.create_publisher(String, "gps/rtk_status", 10)
 
+        # New: track time for NMEA life sign print
+        self._last_nmea_life_sign_time = 0
+        self._nmea_life_sign_interval = NMEA_LIFE_SIGN_INTERVAL
+
         # Start worker threads
         self._rtcm_thread = threading.Thread(
             target=rtcm_forwarder,
@@ -218,10 +225,18 @@ class HelicalGpsNode(Node):
         self.get_logger().info("Helical GPS RTK node started.")
 
     def publish_nmea(self, line: str):
-        """Publish raw NMEA sentence."""
+        """Publish raw NMEA sentence and occasionally print to logger for sign of life."""
         msg = String()
         msg.data = line
         self.nmea_pub.publish(msg)
+
+        # NMEA sign of life logger
+        t_now = time.time()
+        if (t_now - getattr(self, "_last_nmea_life_sign_time", 0)) >= self._nmea_life_sign_interval:
+            self._last_nmea_life_sign_time = t_now
+            # Only log short (first 80 chars) to avoid flooding
+            self.get_logger().info(f"F9P NMEA: {line[:80]}")
+        
 
     def _status_timer_cb(self):
         """Publish NavSatFix and human-readable RTK status string."""
@@ -395,9 +410,7 @@ def nmea_reader(ser_mgr: SerialManager, gnss_status: GNSSStatus, node: HelicalGp
                     node.publish_nmea(line)
                 except Exception as e:
                     node.get_logger().warn(f"Failed to publish NMEA: {e}")
-
-            # Uncomment for debugging raw NMEA:
-            # print(f"[NMEA] {line}")
+            # (No further NMEA logging here; handled in publish_nmea.)
 
             try:
                 msg = pynmea2.parse(line, check=True)
