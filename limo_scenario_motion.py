@@ -444,9 +444,9 @@ class OdomWatcher(Node):
             elapsed = time.time() - start_wall_time
             traveled = speed * elapsed
             
-            if distance > 0 and traveled >= distance:
-                logger.info(f"[circular] Reached distance: traveled={traveled:.3f} m")
-                break
+            # if distance > 0 and traveled >= distance:
+            #     logger.info(f"[circular] Reached distance: traveled={traveled:.3f} m")
+            #     break
 
             if elapsed > max_duration:
                 logger.warn(f"[circular] Max duration {max_duration:.1f} s exceeded; stopping.")
@@ -531,9 +531,9 @@ class OdomWatcher(Node):
             t = elapsed
             # Uniformly scaled original curve parameters (shape-preserving).
             # Original: Ax=20, Wx=0.2, Ay=10, Wy=0.4. Scale s=0.55 -> Ax=11, Ay=5.5.
-            Ax = 11.0
+            Ax = 11/2
             Wx = 0.2
-            Ay = 5.5
+            Ay = 5.5/4
             Wy = 0.4
 
             vx = Ax * Wx * math.cos(Wx * t)
@@ -550,9 +550,9 @@ class OdomWatcher(Node):
                 omega = 0.0
 
             total_traveled += v * dt
-            if distance > 0 and total_traveled >= distance:
-                logger.info(f"[s_curve] Reached distance: traveled={total_traveled:.3f} m")
-                break
+            # if distance > 0 and total_traveled >= distance:
+            #     logger.info(f"[s_curve] Reached distance: traveled={total_traveled:.3f} m")
+            #     break
 
             twist = Twist()
             twist.linear.x = v
