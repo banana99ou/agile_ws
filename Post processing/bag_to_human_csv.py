@@ -19,18 +19,51 @@ Project context:
   which includes MAVLink `fix_type` (richer than NavSatFix.status).
   If unavailable, fall back to `/pixhawk/global_position/raw/fix` (NavSatFix) (coarse).
 
+
+
+Arguments:
+  - --run PATH: Bag directory (must contain `metadata.yaml`) OR a directory containing many bag directories.
+  - --recursive: If `--run` is a directory, scan recursively for bag directories.
+  - --bag-prefix PREFIX: If set, only process bag directories whose folder name starts with PREFIX (e.g. `26_0105_`).
+  - --out-root DIR: Output root directory (default: current working directory).
+  - --desired-flag FLAG: Desired fix flag for debug metrics (default: `F`).
+  - --sustain-s SECONDS: Sustain time for "refix" metric (default: `1.0` seconds).
+  - --debug / --verbose: Write debug-only CSVs (timelines, counts, raw cmd, etc.).
+
+Outputs:
+  - Output directory: `<out-root>/Bag_decoded/<bag_dir_name>/`
+  - Always written:
+    - `validity_summary.csv` (missing required topics, message totals, satellite stats, notes)
+  - Written when the corresponding topic exists / can be decoded (files are created only if at least one row is written):
+    - `gnss_f9p_helical_fix.csv` (decoded `/gps_rtk_f9p_helical/gps/fix`)
+    - `gnss_pixhawk_navsatfix.csv` (decoded `/pixhawk/global_position/raw/fix`)
+    - `pixhawk_gpsraw_gps1.csv` (decoded `/pixhawk/gpsstatus/gps1/raw` when available)
+    - `motion_cmd_vel.csv` (decoded `/cmd_vel`)
+    - `wheel_odom.csv` (decoded `/wheel/odom`)
+    - `imu.csv` (decoded `/imu`)
+    - `estop.csv` (decoded `/estop`)
+  - Debug-only outputs (enabled via `--debug` / `--verbose`, and created only if at least one row is written):
+    - `gnss_f9p_helical_rtk_status.csv` (decoded `/gps_rtk_f9p_helical/gps/rtk_status`)
+    - `pixhawk_satellites.csv` (decoded `/pixhawk/global_position/raw/satellites`)
+    - `motion_cmd_vel_raw.csv` (decoded `/cmd_vel_raw`)
+    - `gnss_timeline.csv` (merged timeline across receivers)
+    - `gnss_f9p_helical_nmea_time.csv` (NMEA UTC time/date extraction)
+    - `gnss_metrics.csv` (refix metrics; depends on `--desired-flag` and `--sustain-s`)
+    - `topic_counts.csv` (message counts per topic/type)
+    - `raw_topics/*.csv` (raw JSON dump for every topic currently recorded by `Data_Logger.py`)
+
 Examples:
   Convert one bag:
-    python3 bag_to_human_csv.py /path/to/bag_dir
+    python3 bag_to_human_csv.py --run /path/to/bag_dir
 
   Convert one bag and put outputs somewhere specific:
-    python3 bag_to_human_csv.py /path/to/bag_dir --out-root /tmp/human
+    python3 bag_to_human_csv.py --run /path/to/bag_dir --out-root /tmp/human
 
   Convert one bag including debug-only CSVs (topic counts, timelines, raw cmd, etc.):
-    python3 bag_to_human_csv.py /path/to/bag_dir --debug
+    python3 bag_to_human_csv.py --run /path/to/bag_dir --debug
 
   Convert all bags under Experiment Data:
-    python3 bag_to_human_csv.py /home/agilex/agilex_ws/Experiment\\ Data --recursive
+    python3 bag_to_human_csv.py --run /home/agilex/agilex_ws/Experiment\\ Data --recursive
 """
 
 from __future__ import annotations
@@ -38,6 +71,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as _dt
+import json
 import math
 import os
 import re
@@ -231,13 +265,7 @@ def open_bag_reader(bag_path: str) -> Tuple[str, Any, Dict[str, str]]:
 # ------------------------- parsing + normalization -------------------------
 
 
-_RTK_STATUS_RE = re.compile(
-    r"^FIX:\s*(?P<fix_desc>.*?)\s*"
-    r"\(quality=(?P<quality>\d+),\s*sats=(?P<sats>\d+),\s*HDOP=(?P<hdop>[^)]+)\)\s*\|\s*"
-    r"Lat=(?P<lat>[^,]+),\s*Lon=(?P<lon>[^|]+)\|\s*"
-    r"RTCM:\s*(?P<rtcm_state>ACTIVE|STALE)\s*"
-    r"\(bytes=(?P<bytes>\d+),\s*age=(?P<age>[\d.]+)s\)\s*$"
-)
+_RTK_STATUS_FIX_DESC_RE = re.compile(r"^\s*FIX:\s*(?P<fix_desc>.*?)\s*\(", re.IGNORECASE)
 
 
 def normalize_fix_flag_from_f9p_status(fix_desc: str, quality: Optional[int]) -> str:
@@ -262,27 +290,48 @@ def normalize_fix_flag_from_f9p_status(fix_desc: str, quality: Optional[int]) ->
 
 
 def parse_helical_rtk_status(s: str) -> Optional[Dict[str, Any]]:
-    m = _RTK_STATUS_RE.match((s or "").strip())
-    if not m:
+    """
+    Parse `/gps_rtk_f9p_helical/gps/rtk_status` strings.
+
+    The producer format has changed over time. Examples seen in the wild:
+      - `FIX: RTK FIXED (quality=4, sats=12, HDOP=0.59) | Lat=.., Lon=.. | RTCM: ACTIVE (bytes=..., age=0.6s)`
+      - `FIX: RTK FIXED (quality=4, sats=12, HDOP=0.59, rate=6.0Hz) | Lat=.., Lon=.. | RTCM: ACTIVE (bytes=..., fwd_age=0.6s, net_age=0.6s)`
+
+    We therefore parse using tolerant regex searches instead of a single strict full-match.
+    """
+    txt = (s or "").strip()
+    if not txt:
         return None
 
-    fix_desc = m.group("fix_desc").strip()
-    quality = _safe_int(m.group("quality"))
-    sats = _safe_int(m.group("sats"))
+    m_desc = _RTK_STATUS_FIX_DESC_RE.search(txt)
+    if not m_desc:
+        return None
+    fix_desc = (m_desc.group("fix_desc") or "").strip()
 
-    hdop_raw = m.group("hdop").strip()
-    hdop = None if hdop_raw.upper() == "N/A" else _safe_float(hdop_raw)
+    quality = _safe_int(_first_group(txt, r"quality\s*=\s*(\d+)"))
+    sats = _safe_int(_first_group(txt, r"sats\s*=\s*(\d+)"))
 
-    lat_raw = m.group("lat").strip()
-    lon_raw = m.group("lon").strip()
-    lat = None if lat_raw.upper() == "N/A" else _safe_float(lat_raw)
-    lon = None if lon_raw.upper() == "N/A" else _safe_float(lon_raw)
+    hdop_raw = (_first_group(txt, r"HDOP\s*=\s*([0-9.]+|N/A)") or "").strip()
+    hdop = None if not hdop_raw or hdop_raw.upper() == "N/A" else _safe_float(hdop_raw)
 
-    rtcm_state = m.group("rtcm_state").strip().upper()
+    lat_raw = (_first_group(txt, r"Lat\s*=\s*([^,|]+)") or "").strip()
+    lon_raw = (_first_group(txt, r"Lon\s*=\s*([^|]+)") or "").strip()
+    lat = None if not lat_raw or lat_raw.upper() == "N/A" else _safe_float(lat_raw)
+    lon = None if not lon_raw or lon_raw.upper() == "N/A" else _safe_float(lon_raw)
+
+    rtcm_state = (_first_group(txt, r"RTCM\s*:\s*(ACTIVE|STALE)", flags=re.IGNORECASE) or "").strip().upper()
     rtcm_active = 1 if rtcm_state == "ACTIVE" else 0
 
-    rtcm_bytes = _safe_int(m.group("bytes")) or 0
-    rtcm_age_s = _safe_float(m.group("age"))
+    rtcm_bytes = _safe_int(_first_group(txt, r"bytes\s*=\s*(\d+)")) or 0
+
+    # Older format: age=0.6s. Newer format: fwd_age=0.6s, net_age=0.6s.
+    age = _safe_float(_first_group(txt, r"\bage\s*=\s*([\d.]+)s", flags=re.IGNORECASE))
+    fwd_age = _safe_float(_first_group(txt, r"\bfwd_age\s*=\s*([\d.]+)s", flags=re.IGNORECASE))
+    net_age = _safe_float(_first_group(txt, r"\bnet_age\s*=\s*([\d.]+)s", flags=re.IGNORECASE))
+
+    # Preserve a single `rtcm_age_s` column for backward compatibility:
+    # prefer `age`, else `net_age`, else `fwd_age`.
+    rtcm_age_s = age if age is not None else (net_age if net_age is not None else fwd_age)
 
     fix_flag = normalize_fix_flag_from_f9p_status(fix_desc=fix_desc, quality=quality)
 
@@ -298,6 +347,16 @@ def parse_helical_rtk_status(s: str) -> Optional[Dict[str, Any]]:
         "rtcm_bytes": rtcm_bytes,
         "rtcm_age_s": "" if rtcm_age_s is None else rtcm_age_s,
     }
+
+
+def _first_group(s: str, pattern: str, flags: int = 0) -> Optional[str]:
+    m = re.search(pattern, s, flags)
+    if not m:
+        return None
+    try:
+        return m.group(1)
+    except Exception:
+        return None
 
 
 def normalize_fix_flag_from_navsat_status(status: Optional[int]) -> str:
@@ -440,6 +499,9 @@ def _nmea_date_time_to_iso_utc(ddmmyy: str, hhmmss: str) -> Optional[str]:
 
 
 class LazyCsv:
+    """
+    called lazycsv because it is a lazy writer, it will not write to the file until the close() method is called.
+    """
     def __init__(self, path: str, fieldnames: List[str]):
         self.path = path
         self.fieldnames = fieldnames
@@ -515,12 +577,29 @@ REQUIRED_TOPICS = [
     "/pixhawk/global_position/raw/satellites",
     "/cmd_vel",
     "/cmd_vel_raw",
+    "/wheel/odom",
     "/imu",
     "/estop",
 ]
 
 # Prefer this if present (future bags)
 PREFERRED_PIXHAWK_FIX_TOPIC = "/pixhawk/gpsstatus/gps1/raw"
+
+# IMPORTANT: Manual snapshot of what `Data_Logger.py` records *today*.
+# This intentionally avoids any runtime import/introspection of Data_Logger.
+DATA_LOGGER_TOPICS = [
+    "/gps_rtk_f9p_helical/gps/fix",
+    "/gps_rtk_f9p_helical/gps/nmea",
+    "/gps_rtk_f9p_helical/gps/rtk_status",
+    "/pixhawk/global_position/raw/satellites",
+    "/pixhawk/global_position/raw/fix",
+    "/pixhawk/gpsstatus/gps1/raw",
+    "/cmd_vel",
+    "/cmd_vel_raw",
+    "/wheel/odom",
+    "/imu",
+    "/estop",
+]
 
 
 def _bag_is_dir(bag_path: str) -> bool:
@@ -538,12 +617,34 @@ def find_bag_dirs(root: str) -> List[str]:
 
 
 def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, sustain_s: float, debug: bool) -> str:
-    bag_base = os.path.basename(os.path.normpath(bag_path)) or "bag"
-    out_root_final = out_root or os.getcwd()
-    out_dir = os.path.join(out_root_final, "human_csv", _sanitize_for_filename(bag_base))
-    os.makedirs(out_dir, exist_ok=True)
+    """
+    Convert a single ROS 2 bag directory into human-readable CSV files.
 
-    backend, reader, topic_type_map = open_bag_reader(bag_path)
+    Args:
+        bag_path (str): Path to the bag directory (should contain metadata.yaml).
+        out_root (Optional[str]): Optional root directory for output. If None, use current working directory.
+        desired_flag (str): Desired fix flag used for metrics calculations (e.g., 'F').
+        sustain_s (float): Sustain time (in seconds) for metrics regarding "refix" events.
+        debug (bool): If True, write extra debug-only CSVs (timelines, counts, raw cmd, etc.).
+
+    Returns:
+        str: Path to the output directory containing the generated human-readable CSVs.
+
+    Steps performed:
+        - Creates/ensures the output directory exists.
+        - Opens the bag reader and determines message types present.
+        - Initializes CSV writers for different required topics.
+        - Reads messages, decodes them topic-by-topic, and writes out to appropriately formatted CSVs.
+        - Calculates and writes extra summary/metrics information.
+        - Optionally outputs debug CSVs if requested.
+        - Closes all writers/resources and returns the output directory path.
+    """
+    bag_base = os.path.basename(os.path.normpath(bag_path)) or "bag" # get the base name of the bag directory
+    out_root_final = out_root or os.getcwd() # get the output root directory
+    out_dir = os.path.join(out_root_final, "Bag_csv", _sanitize_for_filename(bag_base)) # create the output directory path
+    os.makedirs(out_dir, exist_ok=True) # create the output directory if it doesn't exist
+
+    backend, reader, topic_type_map = open_bag_reader(bag_path) # open the bag reader and get the backend, reader, and topic type map
 
     # type cache (rosbag2_py only)
     msg_type_cache: Dict[str, type] = {}
@@ -615,6 +716,28 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
         os.path.join(out_dir, "motion_cmd_vel.csv"),
         ["ts_sec", "ts_iso_utc", "lin_x", "lin_y", "lin_z", "ang_x", "ang_y", "ang_z"],
     )
+    w_wheel_odom = LazyCsv(
+        os.path.join(out_dir, "wheel_odom.csv"),
+        [
+            "ts_sec",
+            "ts_iso_utc",
+            "bag_ts_ns",
+            "hdr_stamp_sec",
+            "hdr_stamp_nanosec",
+            "frame_id",
+            "child_frame_id",
+            "pos_x",
+            "pos_y",
+            "pos_z",
+            "yaw_deg",
+            "lin_vel_x",
+            "lin_vel_y",
+            "lin_vel_z",
+            "ang_vel_x",
+            "ang_vel_y",
+            "ang_vel_z",
+        ],
+    )
     w_cmd_raw: Optional[LazyCsv] = None
     w_imu = LazyCsv(
         os.path.join(out_dir, "imu.csv"),
@@ -654,6 +777,8 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
     )
 
     trackers: Optional[Dict[str, RefixTracker]] = None
+    raw_topic_writers: Optional[Dict[str, LazyCsv]] = None
+    raw_writer_for = None
 
     if debug:
         w_f9p_status = LazyCsv(
@@ -718,6 +843,30 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
             "f9p_helical": RefixTracker("f9p_helical", desired_flag=desired_flag, sustain_s=sustain_s),
             "pixhawk": RefixTracker("pixhawk", desired_flag=desired_flag, sustain_s=sustain_s),
         }
+        raw_topic_writers = {}
+
+        def _raw_writer_for(topic_name: str) -> LazyCsv:
+            assert raw_topic_writers is not None
+            if topic_name in raw_topic_writers:
+                return raw_topic_writers[topic_name]
+            fname = _sanitize_for_filename(topic_name.strip("/").replace("/", "__") or "root")
+            w = LazyCsv(
+                os.path.join(out_dir, "raw_topics", f"{fname}.csv"),
+                [
+                    "ts_sec",
+                    "ts_iso_utc",
+                    "bag_ts_ns",
+                    "hdr_stamp_sec",
+                    "hdr_stamp_nanosec",
+                    "type",
+                    "decode_ok",
+                    "json",
+                ],
+            )
+            raw_topic_writers[topic_name] = w
+            return w
+
+        raw_writer_for = _raw_writer_for
 
     # If GPSRAW exists, prefer it for pixhawk flag timeline.
     # NOTE: Some environments cannot deserialize this message type; detect and fall back.
@@ -793,9 +942,6 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
         total_msgs += 1
         if topic in msg_counts:
             msg_counts[topic] += 1
-        if msg is None:
-            continue
-
         ts_sec = t_ns / 1e9
         ts_iso = _ts_to_iso_utc(ts_sec)
         bag_ts_ns = int(t_ns)
@@ -805,6 +951,29 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
         hdr_stamp = hdr.get("stamp") if isinstance(hdr, dict) else None
         hdr_stamp_sec = _safe_int(hdr_stamp.get("sec")) if isinstance(hdr_stamp, dict) else None
         hdr_stamp_nanosec = _safe_int(hdr_stamp.get("nanosec")) if isinstance(hdr_stamp, dict) else None
+
+        # --- Debug raw dump for every topic Data_Logger records ---
+        if debug and (raw_writer_for is not None) and (topic in DATA_LOGGER_TOPICS):
+            type_str = topic_type_map.get(topic, "")
+            try:
+                json_blob = "" if msg is None else json.dumps(msg, ensure_ascii=False, default=str)
+            except Exception:
+                json_blob = ""
+            raw_writer_for(topic).write(
+                {
+                    "ts_sec": f"{ts_sec:.9f}",
+                    "ts_iso_utc": ts_iso,
+                    "bag_ts_ns": bag_ts_ns,
+                    "hdr_stamp_sec": "" if hdr_stamp_sec is None else hdr_stamp_sec,
+                    "hdr_stamp_nanosec": "" if hdr_stamp_nanosec is None else hdr_stamp_nanosec,
+                    "type": type_str,
+                    "decode_ok": 0 if msg is None else 1,
+                    "json": json_blob,
+                }
+            )
+
+        if msg is None:
+            continue
 
         # --- F9P Helical status (best fix flag) ---
         if topic == "/gps_rtk_f9p_helical/gps/rtk_status":
@@ -1029,6 +1198,57 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
                 w_cmd.write(out_row)
             continue
 
+        # --- wheel odom (nav_msgs/Odometry) ---
+        if topic == "/wheel/odom":
+            frame_id = ""
+            if isinstance(hdr, dict):
+                frame_id = str(hdr.get("frame_id") or "")
+            child_frame_id = str(msg.get("child_frame_id") or "")
+
+            pose = (msg.get("pose") or {}).get("pose") if isinstance(msg.get("pose"), dict) else None
+            pose = pose if isinstance(pose, dict) else {}
+            pos = pose.get("position") if isinstance(pose.get("position"), dict) else {}
+            ori = pose.get("orientation") if isinstance(pose.get("orientation"), dict) else {}
+
+            px = _safe_float((pos or {}).get("x"))
+            py = _safe_float((pos or {}).get("y"))
+            pz = _safe_float((pos or {}).get("z"))
+
+            qx = _safe_float((ori or {}).get("x")) or 0.0
+            qy = _safe_float((ori or {}).get("y")) or 0.0
+            qz = _safe_float((ori or {}).get("z")) or 0.0
+            qw = _safe_float((ori or {}).get("w")) or 1.0
+            yaw_deg = math.degrees(_quat_to_yaw_rad(qx, qy, qz, qw))
+            yaw_deg = (yaw_deg + 360.0) % 360.0
+
+            tw = (msg.get("twist") or {}).get("twist") if isinstance(msg.get("twist"), dict) else None
+            tw = tw if isinstance(tw, dict) else {}
+            lin = tw.get("linear") if isinstance(tw.get("linear"), dict) else {}
+            ang = tw.get("angular") if isinstance(tw.get("angular"), dict) else {}
+
+            w_wheel_odom.write(
+                {
+                    "ts_sec": f"{ts_sec:.9f}",
+                    "ts_iso_utc": ts_iso,
+                    "bag_ts_ns": bag_ts_ns,
+                    "hdr_stamp_sec": "" if hdr_stamp_sec is None else hdr_stamp_sec,
+                    "hdr_stamp_nanosec": "" if hdr_stamp_nanosec is None else hdr_stamp_nanosec,
+                    "frame_id": frame_id,
+                    "child_frame_id": child_frame_id,
+                    "pos_x": "" if px is None else px,
+                    "pos_y": "" if py is None else py,
+                    "pos_z": "" if pz is None else pz,
+                    "yaw_deg": f"{yaw_deg:.3f}",
+                    "lin_vel_x": _safe_float((lin or {}).get("x")) or 0.0,
+                    "lin_vel_y": _safe_float((lin or {}).get("y")) or 0.0,
+                    "lin_vel_z": _safe_float((lin or {}).get("z")) or 0.0,
+                    "ang_vel_x": _safe_float((ang or {}).get("x")) or 0.0,
+                    "ang_vel_y": _safe_float((ang or {}).get("y")) or 0.0,
+                    "ang_vel_z": _safe_float((ang or {}).get("z")) or 0.0,
+                }
+            )
+            continue
+
         # --- IMU ---
         if topic in ("/imu", "/pixhawk/imu/data"):
             ori = msg.get("orientation") or {}
@@ -1125,6 +1345,7 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
         w_px4_fix,
         w_px4_gpsraw,
         w_cmd,
+        w_wheel_odom,
         w_imu,
         w_estop,
         w_validity,
@@ -1135,6 +1356,13 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
     for w in (w_f9p_status, w_px4_sats, w_cmd_raw, w_timeline, w_f9p_nmea_time, w_metrics, w_counts):
         if w is not None:
             w.close()
+
+    if raw_topic_writers is not None:
+        for w in raw_topic_writers.values():
+            try:
+                w.close()
+            except Exception:
+                pass
 
     # Close backend reader if needed
     try:
@@ -1148,13 +1376,9 @@ def convert_bag(bag_path: str, out_root: Optional[str], desired_flag: str, susta
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Convert ros2 bag directories into human-readable CSV outputs.")
-    p.add_argument("path", help="Bag directory (contains metadata.yaml) OR a directory containing many bags.")
-    p.add_argument("--recursive", action="store_true", help="If PATH is a directory, scan recursively for bag dirs.")
-    p.add_argument(
-        "--bag-prefix",
-        default=None,
-        help="If set, only process bag directories whose folder name starts with this prefix (e.g. '26_0105_').",
-    )
+    p.add_argument("--run", required=True, help="Bag directory (contains metadata.yaml) OR a directory containing many bags.")
+    p.add_argument("--recursive", action="store_true", help="If --run is a directory, scan recursively for bag dirs.")
+    p.add_argument("--bag-prefix", default=None, help="If set, only process bag directories whose folder name starts with this prefix (e.g. '26_0105_').",)
     p.add_argument("--out-root", default=None, help="Output root directory (default: current working directory).")
     p.add_argument("--desired-flag", default="F", help="Desired fix flag for metrics (default: F).")
     p.add_argument("--sustain-s", type=float, default=1.0, help="Sustain time for 'refixed' metric (default: 1.0s).")
@@ -1165,7 +1389,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-    path = args.path
+    path = args.run
     debug = bool(getattr(args, "debug", False) or getattr(args, "verbose", False))
     bag_prefix = (getattr(args, "bag_prefix", None) or "").strip() or None
 

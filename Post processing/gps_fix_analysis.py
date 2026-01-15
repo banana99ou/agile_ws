@@ -39,6 +39,7 @@ import argparse
 import csv
 import datetime as _dt
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -285,6 +286,7 @@ def convert_and_load_bag_timeline(
     out_root: Optional[str],
     desired_flag: str,
     sustain_s: float,
+    debug: bool,
 ) -> Tuple[str, List[TimelineRow]]:
     try:
         import bag_to_human_csv  # type: ignore
@@ -294,25 +296,54 @@ def convert_and_load_bag_timeline(
             "(e.g., 'rosbags') are installed."
         ) from e
 
-    # bag_to_human_csv.convert_bag requires a 'debug' flag; we enable it here so the
-    # converter emits its timeline + per-receiver quick metrics (useful for inspection).
-    #
-    # NOTE: Even if timeline is missing for some reason, we can synthesize it from other CSVs below.
-    out_dir = bag_to_human_csv.convert_bag(bag_dir, out_root, desired_flag, sustain_s, debug=True)
+    # NOTE:
+    # - When debug=False, we still get the essential decoded GNSS CSVs (e.g., pixhawk_gpsraw_gps1.csv,
+    #   gnss_f9p_helical_fix.csv) needed to compute fix/refix metrics.
+    # - When debug=True, the converter additionally emits timelines/counts/raw topic dumps for deep dives.
+    out_dir = bag_to_human_csv.convert_bag(bag_dir, out_root, desired_flag, sustain_s, debug=bool(debug))
     timeline_path = os.path.join(out_dir, "gnss_timeline.csv")
+
+    def _read_csv_rows(path: str) -> Iterable[Dict[str, str]]:
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", newline="") as f:
+            yield from csv.DictReader(f)
+
+    def _append_helical_fix_rows(dst: List[TimelineRow]) -> None:
+        """
+        bag_to_human_csv's gnss_timeline.csv may omit helical rows depending on topics/decoder.
+        If a per-receiver helical CSV exists, merge it in so metrics include f9p_helical.
+        """
+        helical_fix_path = os.path.join(out_dir, "gnss_f9p_helical_fix.csv")
+        if not os.path.exists(helical_fix_path):
+            return
+        # Avoid duplicates if the timeline already includes helical.
+        if any(r.receiver == "f9p_helical" for r in dst):
+            return
+        for r in _read_csv_rows(helical_fix_path):
+            ts = _safe_float(r.get("ts_sec"))
+            if ts is None:
+                continue
+            dst.append(
+                TimelineRow(
+                    ts_sec=ts,
+                    ts_iso_utc=str(r.get("ts_iso_utc") or ""),
+                    receiver="f9p_helical",
+                    fix_flag=str(r.get("fix_flag") or ""),
+                    lat=str(r.get("lat") or ""),
+                    lon=str(r.get("lon") or ""),
+                    alt=str(r.get("alt") or ""),
+                    detail=f"helical_fix.navsat_status={r.get('navsat_status','')}; source={r.get('fix_flag_source','')}",
+                )
+            )
+
     if not os.path.exists(timeline_path):
         # Fallback: the bag converter uses lazy CSV writers; if no timeline rows were written,
         # gnss_timeline.csv won't be created. Try to synthesize a timeline from other CSVs.
         synthesized: List[TimelineRow] = []
 
-        def _read_csv_rows(path: str) -> Iterable[Dict[str, str]]:
-            if not os.path.exists(path):
-                return []
-            with open(path, "r", newline="") as f:
-                yield from csv.DictReader(f)
-
-        # F9P helical (best source)
-        for r in _read_csv_rows(os.path.join(out_dir, "gnss_f9p_helical_rtk_status.csv")):
+        # F9P helical: use the decoded NavSatFix CSV (its fix_flag is upgraded using rtk_status when available).
+        for r in _read_csv_rows(os.path.join(out_dir, "gnss_f9p_helical_fix.csv")):
             ts = _safe_float(r.get("ts_sec"))
             if ts is None:
                 continue
@@ -324,8 +355,8 @@ def convert_and_load_bag_timeline(
                     fix_flag=str(r.get("fix_flag") or ""),
                     lat=str(r.get("lat") or ""),
                     lon=str(r.get("lon") or ""),
-                    alt="",
-                    detail=f"{r.get('fix_desc','')}; q={r.get('quality','')}; sats={r.get('sats','')}; hdop={r.get('hdop','')}; rtcm_active={r.get('rtcm_active','')}",
+                    alt=str(r.get("alt") or ""),
+                    detail=f"helical_fix.navsat_status={r.get('navsat_status','')}; source={r.get('fix_flag_source','')}",
                 )
             )
 
@@ -366,8 +397,9 @@ def convert_and_load_bag_timeline(
             )
 
         if synthesized:
-            # Write it for inspection and return it.
-            write_timeline_csv(out_dir, "gnss_timeline.csv", synthesized)
+            # Only emit this intermediate file in debug mode; otherwise keep outputs minimal.
+            if debug:
+                write_timeline_csv(out_dir, "gnss_timeline.csv", synthesized)
             return out_dir, synthesized
 
         # Still nothing: return empty and let caller decide how to proceed.
@@ -392,6 +424,9 @@ def convert_and_load_bag_timeline(
                     detail=str(r.get("detail") or ""),
                 )
             )
+
+    # Merge in helical rows if present but missing from the converter timeline.
+    _append_helical_fix_rows(rows)
 
     return out_dir, rows
 
@@ -449,10 +484,21 @@ def read_bag_time_window_epoch_s(bag_dir: str) -> Tuple[float, float]:
 
 
 def _ensure_ohcoach_importable(repo_root: str) -> None:
-    # ohcoach-cell-tools is a sibling directory of this script in the repo root.
-    ohcoach_root = os.path.join(repo_root, "ohcoach-cell-tools")
-    if os.path.isdir(ohcoach_root) and ohcoach_root not in sys.path:
-        sys.path.insert(0, ohcoach_root)
+    """
+    Ensure the sibling repo `ohcoach-cell-tools/` is importable as `ohcoach_cell_tools`.
+
+    Historically this script lived in the repo root; now it's under `Post processing/`,
+    so we can't assume the provided `repo_root` is the actual repository root.
+    We therefore walk upward from `repo_root` to find `ohcoach-cell-tools/`.
+    """
+    start = Path(repo_root).resolve()
+    for p in (start, *start.parents):
+        ohcoach_root = p / "ohcoach-cell-tools"
+        if ohcoach_root.is_dir():
+            ohcoach_root_str = str(ohcoach_root)
+            if ohcoach_root_str not in sys.path:
+                sys.path.insert(0, ohcoach_root_str)
+            return
 
 
 def _ohcoach_pos_mode_to_fix_flag(pos_mode: str) -> str:
@@ -462,8 +508,13 @@ def _ohcoach_pos_mode_to_fix_flag(pos_mode: str) -> str:
     if v == "D":
         return "D"
     if v == "A":
-        # autonomous fix (no RTK info); treat as 3D best-effort
-        return "3D"
+        # User-confirmed: treat "A" as a startup/invalid sequence for our analysis.
+        # Count it as "no fix" so it doesn't inflate fix time.
+        return "N"
+    if v == "F":
+        return "F"
+    if v == "R":
+        return "R"
     return "U"
 
 
@@ -735,7 +786,40 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=60.0,
         help="When matching FTG to a bag run by time, include this margin (seconds) around the bag window (default: 60s).",
     )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Keep converter debug outputs (timelines/counts/raw topics) instead of cleaning to minimal outputs.",
+    )
     return p.parse_args(argv)
+
+
+def _cleanup_nonessential_outputs(out_dir: str) -> None:
+    """
+    Client-view cleanup: keep only the essential GNSS performance outputs.
+    Everything else (decoded per-topic CSVs, timelines, raw dumps, etc.) is deleted.
+    """
+    keep = {
+        "run_gnss_fix_metrics_summary.csv",
+        "run_gnss_fix_segments.csv",
+        "run_gnss_refix_intervals.csv",
+        "gnss_fix_timeline.png",
+    }
+    p = Path(out_dir)
+    if not p.exists() or not p.is_dir():
+        return
+    for child in p.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+                continue
+            if child.is_file():
+                if child.name in keep:
+                    continue
+                child.unlink(missing_ok=True)  # py3.8+: ok on 3.11+; workspace uses modern python
+        except Exception:
+            # Best-effort cleanup; analysis outputs already written.
+            pass
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -743,9 +827,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.bag and not args.ftg:
         print("Error: provide at least one of --bag or --ftg", file=sys.stderr)
         return 2
+    if args.bag and not args.ftg:
+        print("Error: --ftg is required when analyzing --bag runs (FTG is the reference source).", file=sys.stderr)
+        return 2
 
     desired_flag = str(args.desired_flag).strip()
     sustain_s = float(args.sustain_s)
+    debug = bool(getattr(args, "debug", False))
 
     # Parse FTG once (if provided), then reuse for all bag runs.
     all_ftg_rows_epoch: List[TimelineRow] = []
@@ -783,7 +871,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             try:
                 bag_start_epoch_s, bag_end_epoch_s = read_bag_time_window_epoch_s(bag_dir)
                 out_dir, bag_rows_epoch = convert_and_load_bag_timeline(
-                    bag_dir=bag_dir, out_root=args.out_root, desired_flag=desired_flag, sustain_s=sustain_s
+                    bag_dir=bag_dir,
+                    out_root=args.out_root,
+                    desired_flag=desired_flag,
+                    sustain_s=sustain_s,
+                    debug=debug,
                 )
 
                 # Bag rows are epoch-based; rebase to run start for per-run analysis.
@@ -828,6 +920,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                     prefix="run_",
                 )
 
+                # Primary visualization (client-view). Best-effort: do not fail analysis if plotting fails.
+                try:
+                    import gnss_fix_timeline_plot  # type: ignore
+
+                    gnss_fix_timeline_plot.write_gnss_fix_timeline_png(
+                        Path(out_dir),
+                        prefix="run_",
+                        bag_start_epoch_s=float(bag_start_epoch_s),
+                    )
+                except Exception as _e:
+                    # Keep console clean; diagnostics belong in debug mode.
+                    if debug:
+                        print(f"[WARN] Timeline plot not generated: {_e}", file=sys.stderr)
+
+                # Client-view default: delete non-essential artifacts unless debug is requested.
+                if not debug:
+                    _cleanup_nonessential_outputs(out_dir)
+
                 note = ""
                 if all_ftg_rows_epoch:
                     # best_offset_s is defined only in the bag loop when all_ftg_rows_epoch is set.
@@ -861,6 +971,30 @@ def main(argv: Optional[List[str]] = None) -> int:
                 rows_rel = []
             write_timeline_csv(out_dir, "gnss_timeline.csv", rows_rel)
             write_analysis_outputs(out_dir, rows_rel, desired_flag=desired_flag, sustain_s=sustain_s, prefix="")
+            try:
+                import gnss_fix_timeline_plot  # type: ignore
+
+                gnss_fix_timeline_plot.write_gnss_fix_timeline_png(Path(out_dir), prefix="")
+            except Exception as _e:
+                if debug:
+                    print(f"[WARN] Timeline plot not generated: {_e}", file=sys.stderr)
+            if not debug:
+                # Keep only the essential summary/segments/refix files for FTG-only mode as well.
+                p = Path(out_dir)
+                keep = {
+                    "gnss_fix_metrics_summary.csv",
+                    "gnss_fix_segments.csv",
+                    "gnss_refix_intervals.csv",
+                    "gnss_fix_timeline.png",
+                }
+                for child in p.iterdir():
+                    try:
+                        if child.is_dir():
+                            shutil.rmtree(child, ignore_errors=True)
+                        elif child.is_file() and child.name not in keep:
+                            child.unlink(missing_ok=True)
+                    except Exception:
+                        pass
             print(f"[OK] FTG-only analysis outputs written to: {out_dir} (source={fp})")
 
     return 0
@@ -868,5 +1002,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

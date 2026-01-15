@@ -48,11 +48,25 @@ def _to_float(s: Optional[str]) -> Optional[float]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Interactive plot of all cmd_vel components.")
     ap.add_argument("--run", required=True, help="Run folder (human_csv/<run>.bag/)")
+    ap.add_argument("--png", action="store_true", help="Save a PNG instead of showing interactively.")
+    ap.add_argument("--outdir", default=None, help="Output directory for PNG (implies --png).")
+    ap.add_argument("--out", default=None, help="Explicit output PNG path (implies --png).")
     args = ap.parse_args()
 
     run = Path(args.run)
     if not run.exists() or not run.is_dir():
         raise SystemExit(f"Run folder not found: {run}")
+
+    save_png = bool(args.png or args.outdir or args.out)
+    out: Optional[Path] = None
+    if save_png:
+        if args.out:
+            out = Path(args.out)
+        else:
+            outdir = Path(args.outdir) if args.outdir else run
+            outdir.mkdir(parents=True, exist_ok=True)
+            out = outdir / f"{run.name}__cmd_vel_all.png"
+        out.parent.mkdir(parents=True, exist_ok=True)
 
     p = run / "motion_cmd_vel.csv"
     if not p.exists():
@@ -145,7 +159,13 @@ def main() -> int:
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="0.8", alpha=0.9),
         )
 
-    plt.show()
+    if save_png:
+        assert out is not None
+        fig.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[OK] Saved: {out}")
+    else:
+        plt.show()
     return 0
 
 

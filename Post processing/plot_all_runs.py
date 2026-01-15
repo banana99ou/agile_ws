@@ -78,7 +78,6 @@ def main() -> int:
                     "--png",
                     "--outdir",
                     str(outdir),
-                    "--jan5",
                 ]
                 subprocess.run(cmd_motion, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 

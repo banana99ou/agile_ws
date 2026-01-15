@@ -60,8 +60,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--ftg",
         default=None,
         help=(
-            "Optional Ohcoach cell .ftg file OR directory containing .ftg files. "
-            "If provided, gps_fix_analysis will align FTG rows to each bag's time window."
+            "Ohcoach cell .ftg file OR directory containing .ftg files. "
+            "Required for bag analysis (this pipeline treats FTG as the reference source)."
         ),
     )
     p.add_argument("--ftg-recursive", action="store_true", help="If --ftg is a directory, scan recursively.")
@@ -82,6 +82,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--out-root", default=None, help="Output root directory (default: current working directory).")
     p.add_argument("--desired-flag", default="F", help="Desired fix flag for metrics (default: F).")
     p.add_argument("--sustain-s", type=float, default=1.0, help="Sustain time for 'refixed' metric (default: 1.0s).")
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Keep debug artifacts (decoded per-topic CSVs, timelines, raw dumps). Default is minimal outputs only.",
+    )
     return p.parse_args(argv)
 
 
@@ -90,9 +95,10 @@ def _run_one_bag(
     out_root: Optional[str],
     desired_flag: str,
     sustain_s: float,
-    ftg: Optional[str],
+    ftg: str,
     ftg_recursive: bool,
     match_margin_s: float,
+    debug: bool,
 ) -> int:
     try:
         import gps_fix_analysis  # type: ignore
@@ -113,11 +119,13 @@ def _run_one_bag(
         str(sustain_s),
         "--match-margin-s",
         str(match_margin_s),
+        "--ftg",
+        ftg,
     ]
-    if ftg:
-        argv += ["--ftg", ftg]
-        if ftg_recursive:
-            argv += ["--recursive"]
+    if ftg_recursive:
+        argv += ["--recursive"]
+    if debug:
+        argv += ["--debug"]
     # gps_fix_analysis treats empty out_root as "use defaults"
     argv = [x for x in argv if x != ""]
     return int(gps_fix_analysis.main(argv))
@@ -221,15 +229,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             sustain_s=float(args.sustain_s),
         )
 
+    # Bag analysis requires FTG reference.
+    if not args.ftg:
+        print("Error: --ftg is required for bag analysis (provide a .ftg file or a directory of .ftg files).", file=sys.stderr)
+        return 2
+
     if _bag_is_dir(path):
         return _run_one_bag(
             path,
             args.out_root,
             args.desired_flag,
             float(args.sustain_s),
-            ftg=args.ftg,
+            ftg=str(args.ftg),
             ftg_recursive=bool(args.ftg_recursive),
             match_margin_s=float(args.match_margin_s),
+            debug=bool(args.debug),
         )
 
     if not os.path.isdir(path):
@@ -257,9 +271,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.out_root,
             args.desired_flag,
             float(args.sustain_s),
-            ftg=args.ftg,
+            ftg=str(args.ftg),
             ftg_recursive=bool(args.ftg_recursive),
             match_margin_s=float(args.match_margin_s),
+            debug=bool(args.debug),
         )
         if rc == 0:
             ok += 1

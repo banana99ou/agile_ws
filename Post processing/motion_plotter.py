@@ -2,13 +2,7 @@
 """
 Motion/GNSS/wheel-odom plotter.
 
-Two modes:
-
-1) Legacy (default): one PNG
-  - cmd_vel lin_x
-  - GNSS-derived speed (F9P helical, Pixhawk navsatfix)
-
-2) Jan 5 pipeline mode (`--jan5`): multiple per-run PNGs
+Generates multiple per-run PNGs:
   - cmd_vel: |v| and lin_x only (no other cmd components)
   - speeds: cmd |v| + GNSS (Pixhawk) + GNSS-RTK (F9P) + wheel odom speed
   - XY overlay: GPS (Pixhawk), GPS-RTK (F9P), wheel odom (rotated+translated for overlay)
@@ -56,25 +50,6 @@ def _to_float(s: Optional[str]) -> Optional[float]:
         return None
 
 
-def _load_cmd_lin_x(run: Path) -> Optional[Series]:
-    p = run / "motion_cmd_vel.csv"
-    if not p.exists():
-        return None
-    rows = _read_csv_rows(p)
-    t: List[float] = []
-    y: List[float] = []
-    for row in rows:
-        ts = _to_float(row.get("ts_sec"))
-        lin_x = _to_float(row.get("lin_x"))
-        if ts is None or lin_x is None:
-            continue
-        t.append(ts)
-        y.append(lin_x)
-    if len(t) < 2:
-        return None
-    return Series(name="cmd_vel lin_x [m/s]", t_sec=t, y=y)
-
-
 def _latlon_to_xy_m(lat_deg: float, lon_deg: float, lat0_rad: float, lon0_deg: float, lat0_deg: float) -> Tuple[float, float]:
     # Simple equirectangular approximation
     m_per_deg_lat = 111_320.0
@@ -113,6 +88,7 @@ def _load_cmd_twist(run: Path) -> Optional[Dict[str, List[float]]]:
 def _load_wheel_odom(run: Path) -> Optional[Dict[str, List[float]]]:
     p = run / "wheel_odom.csv"
     if not p.exists():
+        print(f"Warning: wheel_odom.csv not found in {run}")
         return None
     rows = _read_csv_rows(p)
     out: Dict[str, List[float]] = {"t": [], "x": [], "y": [], "vx": [], "vy": [], "vz": [], "wz": []}
@@ -186,51 +162,6 @@ def _speed_from_xy(t: List[float], x: List[float], y: List[float]) -> List[float
     return v
 
 
-def _load_gnss_speed(run: Path, csv_name: str, label: str) -> Optional[Series]:
-    p = run / csv_name
-    if not p.exists():
-        return None
-    rows = _read_csv_rows(p)
-
-    # Collect (t, lat, lon) in-file order, skipping incomplete rows.
-    t: List[float] = []
-    lat: List[float] = []
-    lon: List[float] = []
-    for row in rows:
-        ts = _to_float(row.get("ts_sec"))
-        la = _to_float(row.get("lat") or row.get("latitude"))
-        lo = _to_float(row.get("lon") or row.get("longitude"))
-        if ts is None or la is None or lo is None:
-            continue
-        t.append(ts)
-        lat.append(la)
-        lon.append(lo)
-
-    if len(t) < 2:
-        return None
-
-    # Reference origin at first GNSS point
-    lat0_deg = lat[0]
-    lon0_deg = lon[0]
-    lat0_rad = math.radians(lat0_deg)
-
-    # Compute speed per step, aligned to t[i] (line-by-line, no interpolation)
-    v: List[float] = [float("nan")]
-    prev_x, prev_y = _latlon_to_xy_m(lat[0], lon[0], lat0_rad, lon0_deg, lat0_deg)
-    prev_t = t[0]
-    for i in range(1, len(t)):
-        cur_x, cur_y = _latlon_to_xy_m(lat[i], lon[i], lat0_rad, lon0_deg, lat0_deg)
-        dt = t[i] - prev_t
-        if dt <= 0.0:
-            v.append(float("nan"))
-        else:
-            dist = math.hypot(cur_x - prev_x, cur_y - prev_y)
-            v.append(dist / dt)
-        prev_x, prev_y, prev_t = cur_x, cur_y, t[i]
-
-    return Series(name=label, t_sec=t, y=v)
-
-
 def _global_t0(series: List[Series]) -> float:
     t0 = None
     for s in series:
@@ -239,10 +170,6 @@ def _global_t0(series: List[Series]) -> float:
         mn = min(s.t_sec)
         t0 = mn if t0 is None else min(t0, mn)
     return 0.0 if t0 is None else float(t0)
-
-
-def _default_png_name(run: Path) -> str:
-    return f"{run.name}__cmd_vs_gnss_speed.png"
 
 
 def _is_angular_rate_level_1_3(run_name: str) -> bool:
@@ -309,7 +236,7 @@ def _save_fig(fig: plt.Figure, out: Path) -> None:
     plt.close(fig)
 
 
-def _plot_jan5_motion_and_paths(run: Path, outdir: Path) -> List[Path]:
+def _plot_motion_and_paths(run: Path, outdir: Optional[Path], save_png: bool) -> List[Path]:
     """
     Returns list of written output paths.
     """
@@ -376,9 +303,11 @@ def _plot_jan5_motion_and_paths(run: Path, outdir: Path) -> List[Path]:
     ax2.grid(True, alpha=0.25)
     ax2.legend(loc="upper left", frameon=False)
 
-    out_motion = outdir / f"{run.name}__motion.png"
-    _save_fig(fig, out_motion)
-    written.append(out_motion)
+    if save_png:
+        assert outdir is not None
+        out_motion = outdir / f"{run.name}__motion.png"
+        _save_fig(fig, out_motion)
+        written.append(out_motion)
 
     # ------------------ Figure 2: XY overlay ------------------
     gnss_anchor = gnss_rtk or gnss_gps
@@ -387,7 +316,7 @@ def _plot_jan5_motion_and_paths(run: Path, outdir: Path) -> List[Path]:
         gps_label = "GPS (Pixhawk)"
         rtk_label = "GPS-RTK (F9P)"
 
-        # User-requested: show per-sensor measured radius (circle fit) next to each sensor label.
+        # Show per-sensor measured radius (circle fit) next to each sensor label.
         if _is_angular_rate_level_1_3(run.name):
             if gnss_gps is not None:
                 r_gps = _circle_fit_radius(gnss_gps["x"], gnss_gps["y"])
@@ -420,9 +349,11 @@ def _plot_jan5_motion_and_paths(run: Path, outdir: Path) -> List[Path]:
         ax.grid(True, alpha=0.25)
         ax.legend(loc="upper left", frameon=False)
 
-        out_xy = outdir / f"{run.name}__xy_overlay.png"
-        _save_fig(fig2, out_xy)
-        written.append(out_xy)
+        if save_png:
+            assert outdir is not None
+            out_xy = outdir / f"{run.name}__xy_overlay.png"
+            _save_fig(fig2, out_xy)
+            written.append(out_xy)
 
     # ------------------ Figure 3: angular_rate-only radius verification ------------------
     if _is_angular_rate_level_1_3(run.name) and cmd is not None:
@@ -460,105 +391,48 @@ def _plot_jan5_motion_and_paths(run: Path, outdir: Path) -> List[Path]:
             ax.grid(True, alpha=0.25)
             ax.legend(loc="upper left", frameon=False)
 
-            out_r = outdir / f"{run.name}__angular_rate_radius.png"
-            _save_fig(fig3, out_r)
-            written.append(out_r)
+            if save_png:
+                assert outdir is not None
+                out_r = outdir / f"{run.name}__angular_rate_radius.png"
+                _save_fig(fig3, out_r)
+                written.append(out_r)
 
     return written
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="cmd_vel vs GNSS-derived speed.")
-    ap.add_argument("--run", required=True, help="Run folder (human_csv/<run>.bag/)")
-    ap.add_argument(
-        "--png",
-        action="store_true",
-        help="Save a PNG instead of showing an interactive window (headless-friendly).",
-    )
-    ap.add_argument(
-        "--jan5",
-        action="store_true",
-        help="Generate Jan 5 experiment per-run plots (motion + XY overlay + angular_rate verification).",
-    )
-    ap.add_argument(
-        "--out",
-        default=None,
-        help="Output PNG path (implies --png). If omitted with --png, saves next to the run CSVs.",
-    )
-    ap.add_argument(
-        "--outdir",
-        default=None,
-        help="Output directory for PNG (implies --png). Filename is derived from run name.",
-    )
+    ap = argparse.ArgumentParser(description="Motion/GNSS/wheel-odom plotter (multi-figure per run).")
+    ap.add_argument("--run",    required=True,       help="Run folder (human_csv/<run>.bag/)")
+    ap.add_argument("--png",    action="store_true", help="Save PNGs instead of showing an interactive window (headless-friendly).",)
+    ap.add_argument("--outdir", default=None,        help="Output directory for PNGs (implies --png). Filenames are derived from run name.",)
     args = ap.parse_args()
 
+    # check folder exists
     run = Path(args.run)
     if not run.exists() or not run.is_dir():
         raise SystemExit(f"Run folder not found: {run}")
 
-    save_png = bool(args.png or args.out or args.outdir)
-    out: Optional[Path] = None
+    # prepare outdir
+    save_png = bool(args.png or args.outdir)
     outdir: Optional[Path] = None
     if save_png:
         outdir = Path(args.outdir) if args.outdir else run
         outdir.mkdir(parents=True, exist_ok=True)
-        if args.out:
-            out = Path(args.out)
-        else:
-            out = outdir / _default_png_name(run)
-        out.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.jan5:
-        if not save_png:
-            raise SystemExit("--jan5 is batch-oriented; please pass --png (and optionally --outdir).")
-        assert outdir is not None
-        written = _plot_jan5_motion_and_paths(run, outdir)
+    # plot
+    written = _plot_motion_and_paths(run, outdir=outdir, save_png=save_png)
+
+    # If we couldn't even build the plots (no usable data), fail in both modes.
+    if save_png:
         if not written:
             raise SystemExit(f"No usable data series found in: {run}")
         for p in written:
             print(f"[OK] Saved: {p}")
-        return 0
-
-    series: List[Series] = []
-    s_cmd = _load_cmd_lin_x(run)
-    if s_cmd is not None:
-        series.append(s_cmd)
-
-    s_f9p = _load_gnss_speed(run, "gnss_f9p_helical_fix.csv", "GNSS speed (F9P helical) [m/s]")
-    if s_f9p is not None:
-        series.append(s_f9p)
-
-    s_px4 = _load_gnss_speed(run, "gnss_pixhawk_navsatfix.csv", "GNSS speed (Pixhawk) [m/s]")
-    if s_px4 is not None:
-        series.append(s_px4)
-
-    if not series:
-        raise SystemExit(f"No usable series found in: {run}")
-
-    t0 = _global_t0(series)
-
-    fig, ax = plt.subplots(figsize=(12, 6), layout="constrained")
-    for s in series:
-        t_rel = [tt - t0 for tt in s.t_sec]
-        ax.plot(t_rel, s.y, lw=1.2, label=s.name)
-
-    ax.set_title(f"cmd_vel vs GNSS-derived speed | {run.name}")
-    ax.set_xlabel("Time [s] (shared, relative)")
-    ax.set_ylabel("Speed [m/s]")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=False)
-
-    if save_png:
-        assert out is not None
-        fig.savefig(out, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        print(f"[OK] Saved: {out}")
     else:
+        # Interactive mode: figures were created but not saved/closed.
         plt.show()
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
