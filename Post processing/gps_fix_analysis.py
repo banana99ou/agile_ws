@@ -25,12 +25,13 @@ Ohcoach mapping (best-effort, based on ohcoach-cell-tools README + pos_mode fiel
   else            -> U
 
 Examples:
-  Analyze a ROS2 bag and write outputs under its human_csv folder:
-    python3 gps_fix_analysis.py --bag /path/to/bag_dir
-
-  Analyze Ohcoach .ftg files (file or directory):
-    python3 gps_fix_analysis.py --ftg /path/to/file.ftg --out-root /tmp/out
-    python3 gps_fix_analysis.py --ftg /path/to/dir_with_ftg --recursive
+  Analyze bags under a directory (recursive) and match FTG rows by time:
+    python3 "Post processing/gps_fix_analysis.py" \ 
+        --bag "Experiment Data/26_0107" --bag-recursive \ 
+        --ftg "Experiment Data/26_0107" --recursive \ 
+        --out-root "/Volumes/SHGP31-5/code/agile_ws/plot_0105_0109" \ 
+        --desired-flag F \ 
+        --sustain-s 1.0
 """
 
 from __future__ import annotations
@@ -139,6 +140,24 @@ class FixSegment:
         return max(0.0, self.end_ts - self.start_ts)
 
 
+def _is_desired_fix(row: TimelineRow, desired_flag: str) -> bool:
+    """
+    Decide whether a sample counts as "desired fix" for segment/TTFF computation.
+
+    Default is strict equality (fix_flag == desired_flag). We add a receiver-specific
+    exception for Pixhawk, which uses a regular GPS and cannot reach RTK Fix ('F').
+    For Pixhawk only, treat 'D' as satisfying desired='F'.
+    """
+    f = (row.fix_flag or "").strip().upper()
+    desired = (desired_flag or "").strip().upper()
+    if f == desired:
+        return True
+    # Pixhawk is "regular GPS" (no RTK fix). Treat 3D (and D, if ever emitted) as satisfying desired='F'.
+    if row.receiver == "pixhawk" and desired == "F" and f in {"3D", "D"}:
+        return True
+    return False
+
+
 def _compute_segments_and_refix(
     rows: List[TimelineRow],
     desired_flag: str,
@@ -163,7 +182,7 @@ def _compute_segments_and_refix(
 
     for r in rows_sorted:
         ts = r.ts_sec
-        if r.fix_flag == desired_flag:
+        if _is_desired_fix(r, desired_flag=desired_flag):
             last_desired_ts = ts
             if not in_desired:
                 if candidate_start is None:
@@ -427,7 +446,6 @@ def convert_and_load_bag_timeline(
 
     # Merge in helical rows if present but missing from the converter timeline.
     _append_helical_fix_rows(rows)
-
     return out_dir, rows
 
 
@@ -804,6 +822,8 @@ def _cleanup_nonessential_outputs(out_dir: str) -> None:
         "run_gnss_fix_segments.csv",
         "run_gnss_refix_intervals.csv",
         "gnss_fix_timeline.png",
+        # Keep timeline so the plot can show per-flag background bands.
+        "gnss_timeline_run.csv",
     }
     p = Path(out_dir)
     if not p.exists() or not p.is_dir():
@@ -986,6 +1006,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "gnss_fix_segments.csv",
                     "gnss_refix_intervals.csv",
                     "gnss_fix_timeline.png",
+                    # Keep timeline so the plot can show per-flag background bands.
+                    "gnss_timeline.csv",
                 }
                 for child in p.iterdir():
                     try:

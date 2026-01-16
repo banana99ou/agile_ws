@@ -43,6 +43,123 @@ def _read_csv(path: Path) -> List[Dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+FLAG_QUALITY_ORDER = ["N", "2D", "3D", "D", "R", "F"]
+
+
+@dataclass(frozen=True)
+class TimelineSample:
+    receiver: str
+    ts: float
+    fix_flag: str
+
+
+def _load_flag_timeline_samples(run_dir: Path) -> List[TimelineSample]:
+    """
+    Best-effort: load per-sample fix flags to draw a subtle background layer.
+
+    - Bag+FTG pipeline emits: gnss_timeline_run.csv (run-relative seconds)
+    - FTG-only emits:       gnss_timeline.csv (relative seconds)
+    """
+    candidates = [
+        run_dir / "gnss_timeline_run.csv",
+        run_dir / "gnss_timeline.csv",
+    ]
+    p = next((c for c in candidates if c.exists()), None)
+    if p is None:
+        return []
+
+    rows = _read_csv(p)
+    out: List[TimelineSample] = []
+    for r in rows:
+        rx = str(r.get("receiver") or "").strip()
+        ts = _to_float(r.get("ts_sec"))
+        ff = str(r.get("fix_flag") or "").strip()
+        if not rx or ts is None:
+            continue
+        out.append(TimelineSample(receiver=rx, ts=float(ts), fix_flag=ff))
+    return out
+
+
+def _flag_to_color(flag: str):
+    """
+    Map fix flags to a categorical "quality" gradient color.
+
+    Order (low->high): N, 2D, 3D, D, R, F. Unknowns use a light gray.
+    """
+    import matplotlib.cm as cm
+
+    order = FLAG_QUALITY_ORDER
+    v = (flag or "").strip().upper()
+    if v not in order:
+        return "#bdbdbd"
+    idx = order.index(v)
+    t = idx / max(1, (len(order) - 1))
+    return cm.get_cmap("cividis")(t)
+
+
+def _timeline_to_flag_spans(
+    samples: List[TimelineSample],
+    receiver: str,
+    desired_flag: str,
+    t_min: float,
+    t_max: float,
+) -> List[Tuple[float, float, str]]:
+    """
+    Convert per-sample timeline into stepwise spans: [(start, duration, flag), ...].
+    Excludes spans where flag == desired_flag (case-insensitive).
+    """
+    desired = (desired_flag or "").strip().upper()
+    s = [x for x in samples if x.receiver == receiver and t_min <= x.ts <= t_max]
+    if len(s) < 2:
+        return []
+    s.sort(key=lambda x: x.ts)
+
+    spans: List[Tuple[float, float, str]] = []
+    cur_flag = (s[0].fix_flag or "").strip().upper()
+    cur_start = max(float(s[0].ts), float(t_min))
+    cur_end = cur_start
+
+    for i in range(len(s) - 1):
+        f = (s[i].fix_flag or "").strip().upper()
+        t0 = float(s[i].ts)
+        t1 = float(s[i + 1].ts)
+        if t1 <= t0:
+            continue
+
+        if i == 0:
+            cur_flag = f
+            cur_start = max(t0, float(t_min))
+            cur_end = min(t1, float(t_max))
+            continue
+
+        if f == cur_flag:
+            cur_end = min(t1, float(t_max))
+            continue
+
+        if cur_end > cur_start and cur_flag != desired:
+            spans.append((cur_start, cur_end - cur_start, cur_flag))
+
+        cur_flag = f
+        cur_start = max(t0, float(t_min))
+        cur_end = min(t1, float(t_max))
+
+    # Flush last run, and extend to plot end using last sample.
+    last_flag = (s[-1].fix_flag or "").strip().upper()
+    if last_flag == cur_flag:
+        cur_end = float(t_max)
+    else:
+        if cur_end > cur_start and cur_flag != desired:
+            spans.append((cur_start, cur_end - cur_start, cur_flag))
+        cur_flag = last_flag
+        cur_start = max(float(s[-1].ts), float(t_min))
+        cur_end = float(t_max)
+
+    if cur_end > cur_start and cur_flag != desired:
+        spans.append((cur_start, cur_end - cur_start, cur_flag))
+
+    return spans
+
+
 @dataclass(frozen=True)
 class ReceiverSummary:
     receiver: str
@@ -137,6 +254,7 @@ def write_gnss_fix_timeline_png(
     summaries = _load_summaries(run_dir, prefix=prefix)
     segments = _load_segments(run_dir, prefix=prefix)
     refix_gaps = _load_refix_gaps(run_dir, prefix=prefix)
+    timeline_samples = _load_flag_timeline_samples(run_dir)
 
     receivers = sorted(set(summaries.keys()) | set(segments.keys()) | set(refix_gaps.keys()))
     if not receivers:
@@ -180,18 +298,49 @@ def write_gnss_fix_timeline_png(
     # Draw lanes
     y_ticks = []
     y_labels = []
+    bg_flags_seen: set[str] = set()
     for i, rx in enumerate(receivers):
         y0 = i * (lane_h + lane_gap)
         y_center = y0 + lane_h / 2.0
         y_ticks.append(y_center)
         y_labels.append(rx)
 
+        # Subtle background: show non-desired flags as a thin band.
+        if timeline_samples and desired_flag:
+            band_h = lane_h * 0.45
+            band_y0 = y0 + (lane_h - band_h) / 2.0
+            bg_spans = _timeline_to_flag_spans(
+                timeline_samples,
+                receiver=rx,
+                desired_flag=desired_flag,
+                t_min=float(t_min),
+                t_max=float(t_max),
+            )
+            for st, dur, flag in bg_spans:
+                bg_flags_seen.add(flag)
+                ax.broken_barh(
+                    [(st, dur)],
+                    (band_y0, band_h),
+                    facecolors=_flag_to_color(flag),
+                    alpha=0.14,
+                    linewidth=0,
+                    zorder=0,
+                )
+
         # Refix gaps (loss -> refix) shaded
         for loss_end, refix_start in refix_gaps.get(rx, []):
             x0 = max(loss_end, t_min)
             x1 = min(refix_start, t_max)
             if x1 > x0:
-                ax.axvspan(x0, x1, ymin=(y0 / (y_ticks[-1] + lane_h)), ymax=((y0 + lane_h) / (y_ticks[-1] + lane_h)), color="#d62728", alpha=0.08)
+                ax.axvspan(
+                    x0,
+                    x1,
+                    ymin=(y0 / (y_ticks[-1] + lane_h)),
+                    ymax=((y0 + lane_h) / (y_ticks[-1] + lane_h)),
+                    color="#d62728",
+                    alpha=0.08,
+                    zorder=1,
+                )
 
         # Desired-fix segments bars
         spans: List[Tuple[float, float]] = []
@@ -202,7 +351,7 @@ def write_gnss_fix_timeline_png(
                 continue
             spans.append((x0, x1 - x0))
         if spans:
-            ax.broken_barh(spans, (y0, lane_h), facecolors="#2ca02c", alpha=0.65)
+            ax.broken_barh(spans, (y0, lane_h), facecolors="#2ca02c", alpha=0.65, zorder=2)
 
         # TTFF marker (first sustained fix)
         s = summaries.get(rx)
@@ -232,10 +381,39 @@ def write_gnss_fix_timeline_png(
     ax.set_xlim(t_min, t_max)
     ax.grid(True, axis="x", alpha=0.25)
 
-    # Legend (avoid duplicates)
+    # Legends:
+    # - TTFF (existing)
+    # - Background flag color key (if we drew any background spans)
     handles, labels = ax.get_legend_handles_labels()
+    legend_ttff = None
     if handles and labels:
-        ax.legend(loc="upper right", frameon=False)
+        legend_ttff = ax.legend(loc="upper right", frameon=False)
+
+    if bg_flags_seen:
+        from matplotlib.patches import Patch
+
+        # Prefer ordered display; include unknowns last.
+        ordered = [f for f in FLAG_QUALITY_ORDER if f in bg_flags_seen]
+        unknowns = sorted([f for f in bg_flags_seen if f not in FLAG_QUALITY_ORDER])
+        legend_flags = ordered + unknowns
+
+        flag_handles = [
+            Patch(facecolor=_flag_to_color(f), edgecolor="none", alpha=0.55, label=f) for f in legend_flags
+        ]
+        leg = ax.legend(
+            handles=flag_handles,
+            title="Non-desired flags",
+            loc="upper left",
+            frameon=False,
+            ncol=min(3, max(1, len(flag_handles))),
+            handlelength=1.6,
+            handleheight=0.9,
+            borderaxespad=0.6,
+            columnspacing=0.9,
+            labelspacing=0.4,
+        )
+        if legend_ttff is not None:
+            ax.add_artist(legend_ttff)
 
     out = out_path if out_path else (run_dir / "gnss_fix_timeline.png")
     out.parent.mkdir(parents=True, exist_ok=True)
