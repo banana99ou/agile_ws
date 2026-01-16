@@ -18,6 +18,12 @@ Analyze all bags under a root:
 
 Write outputs somewhere specific:
   python3 gnss_fix_pipeline.py "/Volumes/SHGP31-5/code/agile_ws/Experiment Data" --recursive --out-root "/tmp/gnss_out"
+
+recurse
+  python Post\ processing/gnss_fix_pipeline.py "Experiment Data/26_0105" --recursive --ftg "Experiment Data/26_0105" --ftg-recursive --out-root "/Volumes/SHGP31-5/code/agile_ws/plot_0105_0109" --match-margin-s 10
+  python Post\ processing/gnss_fix_pipeline.py "Experiment Data/26_0107" --recursive --ftg "Experiment Data/26_0107" --ftg-recursive --out-root "/Volumes/SHGP31-5/code/agile_ws/plot_0105_0109" --match-margin-s 10
+  python Post\ processing/gnss_fix_pipeline.py "Experiment Data/26_0108" --recursive --ftg "Experiment Data/26_0108" --ftg-recursive --out-root "/Volumes/SHGP31-5/code/agile_ws/plot_0105_0109" --match-margin-s 10
+  python Post\ processing/gnss_fix_pipeline.py "Experiment Data/26_0109" --recursive --ftg "Experiment Data/26_0109" --ftg-recursive --out-root "/Volumes/SHGP31-5/code/agile_ws/plot_0105_0109" --match-margin-s 10
 """
 
 from __future__ import annotations
@@ -68,7 +74,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--match-margin-s",
         type=float,
-        default=60.0,
+        default=10.0,
         help="When matching FTG to a bag run by time, include this margin around the bag window (default: 60s).",
     )
     p.add_argument(
