@@ -6,7 +6,8 @@ import threading
 import time
 import random
 
-SERIAL_PORT_DEFAULT = "/dev/tty.usbmodem1101"  # base F9P
+# SERIAL_PORT_DEFAULT = "/dev/tty.usbmodem11201"  # base F9P
+SERIAL_PORT_DEFAULT = "/dev/tty.usbmodem101"  # base F9P
 BAUD_DEFAULT = 115200
 
 TCP_HOST_DEFAULT = "0.0.0.0"
@@ -241,6 +242,8 @@ def status_printer():
             print(f"[DEBUG] alive transitioned {last_alive} -> {alive} at {now}")
             if not alive:
                 print(f"[DEBUG] last_data_time={last_data_time}, now={now}, age={now-last_data_time if last_data_time else None}")
+            # Use option 3 to stop execution by raising SystemExit.
+            raise SystemExit
         last_alive = alive
 
         # Debug print on client connect/disconnect
