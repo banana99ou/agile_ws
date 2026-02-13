@@ -47,6 +47,7 @@ ohcoach-cell-tools/FTG/
 ########################
 # Experiment and runtime outputs
 ########################
+Experiment Data/
 plots_all_2026-01-03
 exports_all_*
 human_csv
