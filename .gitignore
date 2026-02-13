@@ -54,3 +54,4 @@ human_csv
 temp*
 estop_debug_*.csv
 rtcm_log_*.csv
+Experiment Data/
